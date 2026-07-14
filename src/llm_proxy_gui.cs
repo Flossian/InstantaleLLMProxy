@@ -56,7 +56,7 @@ class MainForm : Form
     readonly Label[] _dirStatus = new Label[BackendDirs.Length];
     TextBox _rootBox;
     Label _procStatus;
-    DataGridView _grid;
+    TabControl _ruleTabs;
     TextBox _logBox;
     CheckBox _autoRefresh;
     TextBox _prevIn, _prevOut;
@@ -214,54 +214,24 @@ class MainForm : Form
         var bar = new FlowLayoutPanel();
         bar.Dock = DockStyle.Top;
         bar.Height = 34;
-        bar.Controls.Add(MakeButton("保存", 90, delegate { SaveRules(); }));
-        bar.Controls.Add(MakeButton("再読込", 90, delegate
+        bar.Controls.Add(MakeButton("保存", 80, delegate { SaveRules(); }));
+        bar.Controls.Add(MakeButton("再読込", 80, delegate
         {
             if (ConfirmDiscardIfDirty()) LoadRules();
         }));
+        bar.Controls.Add(MakeButton("タブ追加", 90, OnAddTab));
+        bar.Controls.Add(MakeButton("タブ名変更", 100, OnRenameTab));
+        bar.Controls.Add(MakeButton("タブ削除", 90, OnDeleteTab));
         var hint = new Label();
-        hint.Text = "1行=1ルール。チェックを外すと無効化。保存すると起動中のプロキシにも即時反映されます。";
+        hint.Text = "タブ単位のチェックで一括ON/OFF。確率は同じ置換前の中から抽選。保存で即時反映。";
         hint.AutoSize = true;
         hint.ForeColor = Color.Gray;
         hint.Margin = new Padding(10, 8, 3, 0);
         bar.Controls.Add(hint);
 
-        _grid = new DataGridView();
-        _grid.Dock = DockStyle.Fill;
-        _grid.AllowUserToAddRows = true;
-        _grid.AllowUserToResizeRows = false;
-        _grid.RowHeadersWidth = 30;
-        _grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells;
-        _grid.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
-        var colOn = new DataGridViewCheckBoxColumn();
-        colOn.HeaderText = "有効";
-        colOn.Width = 44;
-        colOn.TrueValue = true;
-        colOn.FalseValue = false;
-        var colFrom = new DataGridViewTextBoxColumn();
-        colFrom.HeaderText = "置換前";
-        colFrom.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
-        colFrom.FillWeight = 50;
-        var colTo = new DataGridViewTextBoxColumn();
-        colTo.HeaderText = "置換後";
-        colTo.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
-        colTo.FillWeight = 50;
-        _grid.Columns.Add(colOn);
-        _grid.Columns.Add(colFrom);
-        _grid.Columns.Add(colTo);
-        _grid.CellValueChanged += delegate { _dirty = true; };
-        _grid.RowsRemoved += delegate { _dirty = true; };
-        // 新規行のチェックは既定でON
-        _grid.DefaultValuesNeeded += delegate(object s, DataGridViewRowEventArgs ev)
-        {
-            ev.Row.Cells[0].Value = true;
-        };
-        // チェックボックスはクリック直後に確定させる (即_dirtyにするため)
-        _grid.CurrentCellDirtyStateChanged += delegate
-        {
-            if (_grid.IsCurrentCellDirty && _grid.CurrentCell is DataGridViewCheckBoxCell)
-                _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
-        };
+        // ルールはタブごとのグリッドで管理する (タブ単位で有効/無効を切替可能)
+        _ruleTabs = new TabControl();
+        _ruleTabs.Dock = DockStyle.Fill;
 
         // ---- 置換テスト ----
         var prevGrp = new GroupBox();
@@ -297,10 +267,232 @@ class MainForm : Form
         prevTable.Controls.Add(_prevOut, 2, 0);
         prevGrp.Controls.Add(prevTable);
 
-        page.Controls.Add(_grid);
+        page.Controls.Add(_ruleTabs);
         page.Controls.Add(prevGrp);
         page.Controls.Add(bar);
         return page;
+    }
+
+    // ルールタブ1枚分。TabPage.Tag に格納して相互参照する
+    class RuleTab
+    {
+        public string Name;
+        public bool Enabled;      // タブ単位の有効/無効
+        public TabPage Page;
+        public DataGridView Grid;
+        public CheckBox Check;
+    }
+
+    RuleTab CreateRuleTab(string name, bool enabled)
+    {
+        var tab = new RuleTab();
+        tab.Name = name;
+        tab.Enabled = enabled;
+
+        var page = new TabPage();
+        page.Tag = tab;
+        tab.Page = page;
+
+        var check = new CheckBox();
+        check.Text = "このタブのルールを有効にする";
+        check.AutoSize = true;
+        check.Dock = DockStyle.Top;
+        check.Padding = new Padding(6, 4, 0, 2);
+        check.Checked = enabled;
+        check.CheckedChanged += delegate
+        {
+            tab.Enabled = check.Checked;
+            UpdateTabText(tab);
+            _dirty = true;
+        };
+        tab.Check = check;
+
+        tab.Grid = CreateRuleGrid();
+
+        page.Controls.Add(tab.Grid);
+        page.Controls.Add(check);
+        UpdateTabText(tab);
+        return tab;
+    }
+
+    DataGridView CreateRuleGrid()
+    {
+        var grid = new DataGridView();
+        grid.Dock = DockStyle.Fill;
+        grid.AllowUserToAddRows = true;
+        grid.AllowUserToResizeRows = false;
+        grid.RowHeadersWidth = 30;
+        grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells;
+        grid.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
+        var colOn = new DataGridViewCheckBoxColumn();
+        colOn.HeaderText = "有効";
+        colOn.Width = 40;
+        colOn.TrueValue = true;
+        colOn.FalseValue = false;
+        var colProb = new DataGridViewTextBoxColumn();
+        colProb.HeaderText = "置換確率(%)";
+        colProb.Width = 84;
+        colProb.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
+        var colFrom = new DataGridViewTextBoxColumn();
+        colFrom.HeaderText = "置換前";
+        colFrom.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        colFrom.FillWeight = 50;
+        var colTo = new DataGridViewTextBoxColumn();
+        colTo.HeaderText = "置換後";
+        colTo.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        colTo.FillWeight = 50;
+        grid.Columns.Add(colOn);
+        grid.Columns.Add(colProb);
+        grid.Columns.Add(colFrom);
+        grid.Columns.Add(colTo);
+        grid.CellValueChanged += delegate { _dirty = true; };
+        grid.RowsRemoved += delegate { _dirty = true; };
+        // 新規行のチェックは既定でON、置換確率は100
+        grid.DefaultValuesNeeded += delegate(object s, DataGridViewRowEventArgs ev)
+        {
+            ev.Row.Cells[0].Value = true;
+            ev.Row.Cells[1].Value = "100";
+        };
+        // チェックボックスはクリック直後に確定させる (即_dirtyにするため)
+        grid.CurrentCellDirtyStateChanged += delegate
+        {
+            if (grid.IsCurrentCellDirty && grid.CurrentCell is DataGridViewCheckBoxCell)
+                grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+        };
+        return grid;
+    }
+
+    void UpdateTabText(RuleTab tab)
+    {
+        tab.Page.Text = (tab.Enabled ? "" : "[OFF] ") + tab.Name;
+    }
+
+    // 同名タブがあればそれを返し、無ければ新規作成して末尾に追加する
+    RuleTab AddRuleTab(string name, bool enabled)
+    {
+        if (name.Length == 0) name = DefaultTabName;
+        RuleTab found = FindRuleTab(name);
+        if (found != null) return found;
+        var tab = CreateRuleTab(name, enabled);
+        _ruleTabs.TabPages.Add(tab.Page);
+        return tab;
+    }
+
+    RuleTab FindRuleTab(string name)
+    {
+        foreach (TabPage p in _ruleTabs.TabPages)
+        {
+            var t = (RuleTab)p.Tag;
+            if (t.Name == name) return t;
+        }
+        return null;
+    }
+
+    RuleTab CurrentRuleTab()
+    {
+        TabPage p = _ruleTabs.SelectedTab;
+        return p == null ? null : (RuleTab)p.Tag;
+    }
+
+    void OnAddTab(object sender, EventArgs e)
+    {
+        string name = PromptText(this, "タブ追加", "新しいタブの名前:", "");
+        if (name == null) return;
+        if (name.Length == 0)
+        {
+            MessageBox.Show(this, "タブ名を入力してください。", "入力エラー",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (FindRuleTab(name) != null)
+        {
+            MessageBox.Show(this, "同じ名前のタブがあります: " + name, "入力エラー",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var tab = AddRuleTab(name, true);
+        _ruleTabs.SelectedTab = tab.Page;
+        _dirty = true;
+    }
+
+    void OnRenameTab(object sender, EventArgs e)
+    {
+        var tab = CurrentRuleTab();
+        if (tab == null) return;
+        string name = PromptText(this, "タブ名変更", "タブの名前:", tab.Name);
+        if (name == null || name == tab.Name) return;
+        if (name.Length == 0)
+        {
+            MessageBox.Show(this, "タブ名を入力してください。", "入力エラー",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (FindRuleTab(name) != null)
+        {
+            MessageBox.Show(this, "同じ名前のタブがあります: " + name, "入力エラー",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        tab.Name = name;
+        UpdateTabText(tab);
+        _dirty = true;
+    }
+
+    void OnDeleteTab(object sender, EventArgs e)
+    {
+        if (_ruleTabs.TabPages.Count <= 1)
+        {
+            MessageBox.Show(this, "最後のタブは削除できません。", "タブ削除",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var tab = CurrentRuleTab();
+        if (tab == null) return;
+        int n = tab.Grid.Rows.Count - (tab.Grid.AllowUserToAddRows ? 1 : 0);
+        if (MessageBox.Show(this,
+                "タブ「" + tab.Name + "」とそのルール" + n + "件を削除します。よろしいですか?",
+                "タブ削除", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+            return;
+        _ruleTabs.TabPages.Remove(tab.Page);
+        _dirty = true;
+    }
+
+    // 1行入力の簡易ダイアログ。キャンセル時は null
+    static string PromptText(IWin32Window owner, string title, string label, string initial)
+    {
+        using (var dlg = new Form())
+        {
+            dlg.Text = title;
+            dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+            dlg.MinimizeBox = false;
+            dlg.MaximizeBox = false;
+            dlg.ShowInTaskbar = false;
+            dlg.StartPosition = FormStartPosition.CenterParent;
+            dlg.ClientSize = new Size(340, 104);
+            var lbl = new Label();
+            lbl.Text = label;
+            lbl.AutoSize = true;
+            lbl.Location = new Point(12, 12);
+            var box = new TextBox();
+            box.Location = new Point(12, 34);
+            box.Width = 316;
+            box.Text = initial;
+            var ok = new Button();
+            ok.Text = "OK";
+            ok.DialogResult = DialogResult.OK;
+            ok.SetBounds(172, 68, 75, 26);
+            var cancel = new Button();
+            cancel.Text = "キャンセル";
+            cancel.DialogResult = DialogResult.Cancel;
+            cancel.SetBounds(253, 68, 75, 26);
+            dlg.Controls.Add(lbl);
+            dlg.Controls.Add(box);
+            dlg.Controls.Add(ok);
+            dlg.Controls.Add(cancel);
+            dlg.AcceptButton = ok;
+            dlg.CancelButton = cancel;
+            return dlg.ShowDialog(owner) == DialogResult.OK ? box.Text.Trim() : null;
+        }
     }
 
     TabPage BuildLogTab()
@@ -515,9 +707,9 @@ class MainForm : Form
             // 対象フォルダにルールファイルが無いとラッパーは何も置換しないので、グリッドの内容で作成する
             if (!File.Exists(_rulesPath))
             {
-                var rules = CollectRules(false);
-                WriteRulesFile(rules);
-                results.AppendLine("llm_replacements.txt を新規作成 (" + rules.Count + "件)");
+                var tabs = CollectAllTabs(false);
+                WriteRulesFile(tabs);
+                results.AppendLine("llm_replacements.txt を新規作成 (" + CountRules(tabs) + "件)");
             }
             MessageBox.Show(this, results.ToString(), "MOD適用 完了",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -643,21 +835,44 @@ class MainForm : Form
     class RuleEntry
     {
         public bool Enabled;
+        public int Prob; // 置換確率 (0-100)
         public string From;
         public string To;
     }
 
+    // タブ1枚分の保存用データ
+    class TabRules
+    {
+        public string Name;
+        public bool Enabled;
+        public List<RuleEntry> Rules;
+    }
+
     const string DisabledPrefix = "#off:";
+    const string TabPrefix = "#tab:";       // 有効なタブのセクション行
+    const string OffTabPrefix = "#offtab:"; // 無効化されたタブのセクション行
+    const string DefaultTabName = "標準";   // タブ行が無い旧形式ファイル用
 
     void LoadRules()
     {
-        _grid.Rows.Clear();
+        _ruleTabs.TabPages.Clear();
+        RuleTab cur = null;
         if (File.Exists(_rulesPath))
         {
             foreach (string raw in File.ReadAllLines(_rulesPath, Encoding.UTF8))
             {
                 string line = raw.Trim().TrimStart('\uFEFF').Trim();
                 if (line.Length == 0) continue;
+                if (line.StartsWith(TabPrefix, StringComparison.Ordinal))
+                {
+                    cur = AddRuleTab(line.Substring(TabPrefix.Length).Trim(), true);
+                    continue;
+                }
+                if (line.StartsWith(OffTabPrefix, StringComparison.Ordinal))
+                {
+                    cur = AddRuleTab(line.Substring(OffTabPrefix.Length).Trim(), false);
+                    continue;
+                }
                 bool enabled = true;
                 if (line.StartsWith(DisabledPrefix, StringComparison.Ordinal))
                 {
@@ -667,23 +882,39 @@ class MainForm : Form
                 else if (line.StartsWith("#", StringComparison.Ordinal)) continue;
                 int idx = line.IndexOf("=>", StringComparison.Ordinal);
                 if (idx <= 0) continue;
-                _grid.Rows.Add(enabled, line.Substring(0, idx), line.Substring(idx + 2));
+                string from = line.Substring(0, idx);
+                string rest = line.Substring(idx + 2);
+                // 「置換前=>置換後=>確率」形式。確率 (0-100) は省略可能で、省略時は100
+                int prob = 100;
+                int idx2 = rest.LastIndexOf("=>", StringComparison.Ordinal);
+                if (idx2 >= 0)
+                {
+                    int p;
+                    if (int.TryParse(rest.Substring(idx2 + 2).Trim(), out p) && p >= 0 && p <= 100)
+                    {
+                        prob = p;
+                        rest = rest.Substring(0, idx2);
+                    }
+                }
+                if (cur == null) cur = AddRuleTab(DefaultTabName, true); // 旧形式 (タブ行なし)
+                cur.Grid.Rows.Add(enabled, prob.ToString(), from, rest);
             }
         }
+        if (_ruleTabs.TabPages.Count == 0) AddRuleTab(DefaultTabName, true);
         _dirty = false;
     }
 
     void SaveRules()
     {
-        var rules = CollectRules(true);
-        if (rules == null) return; // バリデーションエラー
+        var tabs = CollectAllTabs(true);
+        if (tabs == null) return; // バリデーションエラー
 
         try
         {
-            WriteRulesFile(rules);
+            WriteRulesFile(tabs);
             _dirty = false;
             MessageBox.Show(this,
-                rules.Count + "件のルールを保存しました。\n保存先: " + _rulesPath +
+                CountRules(tabs) + "件のルール (" + tabs.Count + "タブ) を保存しました。\n保存先: " + _rulesPath +
                 "\n起動中のプロキシには次のLLMリクエストから自動反映されます。",
                 "保存完了", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -697,73 +928,166 @@ class MainForm : Form
     }
 
     // 対象フォルダの llm_replacements.txt にルールを書き出す
-    void WriteRulesFile(List<RuleEntry> rules)
+    void WriteRulesFile(List<TabRules> tabs)
     {
         var sb = new StringBuilder();
         sb.AppendLine("# ============================================================");
         sb.AppendLine("# LLMリクエスト置換ルール (llm_proxy用)");
-        sb.AppendLine("# ・1行1ルール:  置換前=>置換後");
+        sb.AppendLine("# ・1行1ルール:  置換前=>置換後=>置換確率");
+        sb.AppendLine("# ・置換確率は0-100の整数。省略時は100 (常に置換)");
+        sb.AppendLine("# ・同じ置換前のルールが複数ある場合、確率に応じてどれか1つを選択");
+        sb.AppendLine("#   (確率の合計が100を超える場合は 値/合計 の割合で必ずどれかに置換)");
+        sb.AppendLine("# ・#tab:タブ名 の行から次のタブ行までが1つのタブ (GUIのタブと連動)");
+        sb.AppendLine("# ・#offtab:タブ名 は無効化されたタブ (中のルールはすべて無視)");
         sb.AppendLine("# ・行頭 # はコメント / UTF-8で保存");
         sb.AppendLine("# ・行頭 #off: は無効化されたルール (GUIの「有効」チェックで切替)");
         sb.AppendLine("# ・変更を保存すると次のLLMリクエストから自動反映 (ゲーム再起動不要)");
         sb.AppendLine("# ・このファイルは管理GUIからも編集できます (InstantaleLlmProxy.exe)");
         sb.AppendLine("# ============================================================");
-        sb.AppendLine();
-        foreach (var r in rules)
-            sb.AppendLine((r.Enabled ? "" : DisabledPrefix) + r.From + "=>" + r.To);
+        foreach (var t in tabs)
+        {
+            sb.AppendLine();
+            sb.AppendLine((t.Enabled ? TabPrefix : OffTabPrefix) + t.Name);
+            foreach (var r in t.Rules)
+                sb.AppendLine((r.Enabled ? "" : DisabledPrefix) + r.From + "=>" + r.To +
+                              (r.Prob == 100 ? "" : "=>" + r.Prob));
+        }
         Directory.CreateDirectory(Path.GetDirectoryName(_rulesPath)); // 新配置のフォルダが無ければ作る
         File.WriteAllText(_rulesPath, sb.ToString(), new UTF8Encoding(true));
     }
 
-    // グリッドからルールを集める。validate=trueで不正時にメッセージを出してnullを返す
-    List<RuleEntry> CollectRules(bool validate)
+    // 全タブのルールを集める。validate=trueで不正時にメッセージを出してnullを返す
+    List<TabRules> CollectAllTabs(bool validate)
+    {
+        var tabs = new List<TabRules>();
+        foreach (TabPage p in _ruleTabs.TabPages)
+        {
+            var t = (RuleTab)p.Tag;
+            var rules = CollectRules(t, validate);
+            if (rules == null) return null;
+            tabs.Add(new TabRules { Name = t.Name, Enabled = t.Enabled, Rules = rules });
+        }
+        return tabs;
+    }
+
+    static int CountRules(List<TabRules> tabs)
+    {
+        int n = 0;
+        foreach (var t in tabs) n += t.Rules.Count;
+        return n;
+    }
+
+    // 有効なタブの有効なルールだけを集める (プロキシが実際に適用するもの)
+    List<RuleEntry> CollectActiveRules()
+    {
+        var act = new List<RuleEntry>();
+        var tabs = CollectAllTabs(false);
+        foreach (var t in tabs)
+        {
+            if (!t.Enabled) continue;
+            foreach (var r in t.Rules)
+                if (r.Enabled && r.From.Length > 0) act.Add(r);
+        }
+        return act;
+    }
+
+    // 1タブのグリッドからルールを集める。validate=trueで不正時にメッセージを出してnullを返す
+    List<RuleEntry> CollectRules(RuleTab tab, bool validate)
     {
         var rules = new List<RuleEntry>();
-        foreach (DataGridViewRow row in _grid.Rows)
+        foreach (DataGridViewRow row in tab.Grid.Rows)
         {
             if (row.IsNewRow) continue;
             object on = row.Cells[0].Value;
             bool enabled = !(on is bool) || (bool)on; // 未設定はONとみなす
-            string from = Convert.ToString(row.Cells[1].Value);
-            string to = Convert.ToString(row.Cells[2].Value);
+            string probText = Convert.ToString(row.Cells[1].Value);
+            string from = Convert.ToString(row.Cells[2].Value);
+            string to = Convert.ToString(row.Cells[3].Value);
+            if (probText == null) probText = "";
             if (from == null) from = "";
             if (to == null) to = "";
+            probText = probText.Trim();
             from = from.Trim();
             to = to.Trim();
             if (from.Length == 0 && to.Length == 0) continue;
+            int prob = 100; // 未入力は100 (常に置換)
+            bool probOk = probText.Length == 0 ||
+                          (int.TryParse(probText, out prob) && prob >= 0 && prob <= 100);
+            if (!probOk) prob = 100;
             if (validate)
             {
                 if (from.Length == 0)
                 {
-                    MessageBox.Show(this, (row.Index + 1) + "行目: 置換前が空です。", "入力エラー",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    ShowRuleError(tab, row, "置換前が空です。");
+                    return null;
+                }
+                if (!probOk)
+                {
+                    ShowRuleError(tab, row, "置換確率は0〜100の整数で入力してください。");
                     return null;
                 }
                 if (from.Contains("=>") || to.Contains("=>"))
                 {
-                    MessageBox.Show(this, (row.Index + 1) + "行目: 「=>」は使用できません。", "入力エラー",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    ShowRuleError(tab, row, "「=>」は使用できません。");
                     return null;
                 }
                 if (from.Contains("\n") || to.Contains("\n"))
                 {
-                    MessageBox.Show(this, (row.Index + 1) + "行目: 改行は使用できません。", "入力エラー",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    ShowRuleError(tab, row, "改行は使用できません。");
                     return null;
                 }
             }
-            rules.Add(new RuleEntry { Enabled = enabled, From = from, To = to });
+            rules.Add(new RuleEntry { Enabled = enabled, Prob = prob, From = from, To = to });
         }
         return rules;
     }
 
+    void ShowRuleError(RuleTab tab, DataGridViewRow row, string msg)
+    {
+        _ruleTabs.SelectedTab = tab.Page; // 問題のあるタブを前面に出す
+        MessageBox.Show(this, "タブ「" + tab.Name + "」" + (row.Index + 1) + "行目: " + msg,
+            "入力エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
+
+    readonly Random _previewRng = new Random();
+
+    // プロキシと同じロジック: 有効なタブの有効なルールを対象に、同一「置換前」の
+    // ルールをグループ化し、確率で置換の有無と置換先を1つ選ぶ (押すたびに結果が変わりうる)
     void OnPreview(object sender, EventArgs e)
     {
-        var rules = CollectRules(false);
+        var rules = CollectActiveRules();
         string text = _prevIn.Text;
+
+        var groups = new List<List<RuleEntry>>();
+        var index = new Dictionary<string, List<RuleEntry>>(StringComparer.Ordinal);
         foreach (var r in rules)
         {
-            if (r.Enabled && r.From.Length > 0) text = text.Replace(r.From, r.To);
+            List<RuleEntry> g;
+            if (!index.TryGetValue(r.From, out g))
+            {
+                g = new List<RuleEntry>();
+                index.Add(r.From, g);
+                groups.Add(g);
+            }
+            g.Add(r);
+        }
+
+        foreach (var g in groups)
+        {
+            if (!text.Contains(g[0].From)) continue;
+            int total = 0;
+            foreach (var r in g) total += r.Prob;
+            if (total <= 0) continue;
+            // 合計100以下: 残りの確率は無置換。合計100超: 値/合計 の割合で必ずどれかに置換
+            int roll = _previewRng.Next(Math.Max(total, 100));
+            RuleEntry chosen = null;
+            int acc = 0;
+            foreach (var r in g)
+            {
+                acc += r.Prob;
+                if (roll < acc) { chosen = r; break; }
+            }
+            if (chosen != null) text = text.Replace(chosen.From, chosen.To);
         }
         _prevOut.Text = text;
     }

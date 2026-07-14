@@ -12,8 +12,12 @@
 // ルールファイル: <MODフォルダ>\llm_replacements.txt (UTF-8)
 //   MODフォルダの場所は、適用時に exe と同じ場所に書かれる llm_proxy_dir.txt で
 //   確実に特定する。無い場合のみ後方互換で上位フォルダから探索する。
-//   1行1ルール「置換前=>置換後」。行頭 # はコメント。
+//   1行1ルール「置換前=>置換後=>置換確率」。確率(0-100)は省略可で省略時100。行頭 # はコメント。
+//   同一の置換前を持つルールが複数ある場合は確率に応じてどれか1つが選ばれる
+//   (確率の合計が100を超える場合は 値/合計 の割合で必ずどれかに置換)。
 //   GUIで無効化されたルールは「#off:」付きで保存され、コメントとして無視される。
+//   「#tab:タブ名」から次のタブ行まではそのタブのルール。「#offtab:タブ名」は
+//   無効化されたタブで、中のルールはすべて無視される (GUIのタブと連動)。
 //   ファイルの更新はリクエストごとに検知して自動再読込する (ゲーム再起動不要)。
 //   Pythonクライアントが日本語を \uXXXX エスケープして送る場合にも対応するため、
 //   各ルールのエスケープ版も自動生成して照合する。
@@ -46,12 +50,14 @@ static class LlmProxy
 
     // 置換ルール。From/To は照合・置換に使う実体 (\uXXXX エスケープ版も別ルールとして登録)。
     // DispFrom/DispTo はログ表示用の読みやすい形 (常に元の日本語)。
+    // Prob は置換確率 (0-100)。同一Fromのルールはグループ化され、確率でどれか1つ (または無置換) が選ばれる。
     class Rule
     {
         public string From;
         public string To;
         public string DispFrom;
         public string DispTo;
+        public int Prob;
     }
 
     // 現在有効なルール一覧。再読込時は新しいリストへ丸ごと差し替える (読む側はロック不要)
@@ -403,10 +409,16 @@ static class LlmProxy
     static List<Rule> LoadRules(string path)
     {
         var rules = new List<Rule>();
+        // \u30BF\u30D6\u30BB\u30AF\u30B7\u30E7\u30F3: \u300C#tab:\u540D\u524D\u300D\u4EE5\u964D\u306F\u6709\u52B9\u30BF\u30D6\u3001\u300C#offtab:\u540D\u524D\u300D\u4EE5\u964D\u306F\u7121\u52B9\u30BF\u30D6 (\u4E2D\u306E\u30EB\u30FC\u30EB\u3092\u7121\u8996)
+        bool tabEnabled = true;
         foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
         {
             string line = raw.Trim().TrimStart('\uFEFF').Trim();
-            if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
+            if (line.Length == 0) continue;
+            if (line.StartsWith("#tab:", StringComparison.Ordinal)) { tabEnabled = true; continue; }
+            if (line.StartsWith("#offtab:", StringComparison.Ordinal)) { tabEnabled = false; continue; }
+            if (line.StartsWith("#", StringComparison.Ordinal)) continue;
+            if (!tabEnabled) continue;
             int idx = line.IndexOf("=>", StringComparison.Ordinal);
             if (idx <= 0)
             {
@@ -414,8 +426,21 @@ static class LlmProxy
                 continue;
             }
             string from = line.Substring(0, idx);
-            string to = line.Substring(idx + 2);
-            rules.Add(new Rule { From = from, To = to, DispFrom = from, DispTo = to });
+            string rest = line.Substring(idx + 2);
+            // 「置換前=>置換後=>確率」形式。確率 (0-100) は省略可能で、省略時は100
+            int prob = 100;
+            int idx2 = rest.LastIndexOf("=>", StringComparison.Ordinal);
+            if (idx2 >= 0)
+            {
+                int p;
+                if (int.TryParse(rest.Substring(idx2 + 2).Trim(), out p) && p >= 0 && p <= 100)
+                {
+                    prob = p;
+                    rest = rest.Substring(0, idx2);
+                }
+            }
+            string to = rest;
+            rules.Add(new Rule { From = from, To = to, DispFrom = from, DispTo = to, Prob = prob });
             // Pythonの json.dumps(ensure_ascii=True) は日本語を \uXXXX にするので、その形も登録
             string ef = EscapeNonAscii(from);
             if (ef != from)
@@ -424,7 +449,8 @@ static class LlmProxy
                     From = ef,
                     To = EscapeNonAscii(to),
                     DispFrom = from + "〔エスケープ形式〕",
-                    DispTo = to
+                    DispTo = to,
+                    Prob = prob
                 });
         }
         return rules;
@@ -466,6 +492,8 @@ static class LlmProxy
         }
     }
 
+    static readonly Random Rng = new Random();
+
     static byte[] ApplyRules(byte[] body, string reqLine)
     {
         ReloadRulesIfChanged();
@@ -475,14 +503,55 @@ static class LlmProxy
         try { text = new UTF8Encoding(false, true).GetString(body); }
         catch { return body; } // バイナリはそのまま
         bool changed = false;
+
+        // 同一「置換前」のルールをグループ化する (出現順を保持)
+        var groups = new List<List<Rule>>();
+        var index = new Dictionary<string, List<Rule>>(StringComparer.Ordinal);
         foreach (var rule in rules)
         {
-            if (text.Contains(rule.From))
+            List<Rule> g;
+            if (!index.TryGetValue(rule.From, out g))
             {
-                text = text.Replace(rule.From, rule.To);
-                changed = true;
-                Log("[REPLACE] " + reqLine + " | \"" + Snip(rule.DispFrom) + "\" -> \"" + Snip(rule.DispTo) + "\"");
+                g = new List<Rule>();
+                index.Add(rule.From, g);
+                groups.Add(g);
             }
+            g.Add(rule);
+        }
+
+        // グループごとに1回抽選し、置換するかどうかと置換先を決める。
+        // 合計が100以下: 各ルールは (確率/100) で発動し、残りは無置換。
+        // 合計が100超 : 各ルールは (確率/合計) で発動し、必ずどれかに置換される。
+        foreach (var g in groups)
+        {
+            if (!text.Contains(g[0].From)) continue;
+            int total = 0;
+            foreach (var r in g) total += r.Prob;
+            if (total <= 0)
+            {
+                Log("[SKIP] " + reqLine + " | \"" + Snip(g[0].DispFrom) + "\" 確率0のため置換せず");
+                continue;
+            }
+            int denom = Math.Max(total, 100);
+            int roll;
+            lock (Rng) roll = Rng.Next(denom);
+            Rule chosen = null;
+            int acc = 0;
+            foreach (var r in g)
+            {
+                acc += r.Prob;
+                if (roll < acc) { chosen = r; break; }
+            }
+            if (chosen == null)
+            {
+                Log("[SKIP] " + reqLine + " | \"" + Snip(g[0].DispFrom) + "\" 確率判定により置換せず (" +
+                    total + "/" + denom + ")");
+                continue;
+            }
+            text = text.Replace(chosen.From, chosen.To);
+            changed = true;
+            Log("[REPLACE] " + reqLine + " | \"" + Snip(chosen.DispFrom) + "\" -> \"" + Snip(chosen.DispTo) +
+                "\" (確率" + chosen.Prob + "/" + denom + ")");
         }
         return changed ? Encoding.UTF8.GetBytes(text) : body;
     }
