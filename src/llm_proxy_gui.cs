@@ -57,6 +57,9 @@ class MainForm : Form
     TextBox _rootBox;
     Label _procStatus;
     TabControl _ruleTabs;
+    TabPage _allPage;             // 全タブ横断表示 (読み取り専用・検索付き)
+    DataGridView _allGrid;
+    TextBox _allSearch;
     TextBox _logBox;
     CheckBox _autoRefresh;
     TextBox _prevIn, _prevOut;
@@ -78,17 +81,20 @@ class MainForm : Form
         // 既定はGUIの親フォルダ。前回選択した対象フォルダが有効ならそちらを優先
         string root = Path.GetFullPath(Path.Combine(exeDir, ".."));
         if (!Directory.Exists(Path.Combine(root, "bin"))) root = exeDir;
+        string[] cfgLines = null;
         try
         {
-            if (File.Exists(_configPath))
-            {
-                string saved = File.ReadAllText(_configPath, Encoding.UTF8).Trim();
-                if (saved.Length > 0 && Directory.Exists(Path.Combine(saved, "bin"))) root = saved;
-            }
+            if (File.Exists(_configPath)) cfgLines = File.ReadAllLines(_configPath, Encoding.UTF8);
         }
         catch { }
+        if (cfgLines != null && cfgLines.Length > 0)
+        {
+            string saved = cfgLines[0].Trim();
+            if (saved.Length > 0 && Directory.Exists(Path.Combine(saved, "bin"))) root = saved;
+        }
 
         BuildUi();
+        ApplySavedWindowBounds(cfgLines);
         SetRoot(root, false);
 
         _timer = new Timer();
@@ -223,7 +229,7 @@ class MainForm : Form
         bar.Controls.Add(MakeButton("タブ名変更", 100, OnRenameTab));
         bar.Controls.Add(MakeButton("タブ削除", 90, OnDeleteTab));
         var hint = new Label();
-        hint.Text = "タブ単位のチェックで一括ON/OFF。確率は同じ置換前の中から抽選。保存で即時反映。";
+        hint.Text = "タブ単位のチェックで一括ON/OFF。確率は同じ置換前の中から抽選。保存で即時反映。セル内改行は Shift+Enter。";
         hint.AutoSize = true;
         hint.ForeColor = Color.Gray;
         hint.Margin = new Padding(10, 8, 3, 0);
@@ -232,6 +238,13 @@ class MainForm : Form
         // ルールはタブごとのグリッドで管理する (タブ単位で有効/無効を切替可能)
         _ruleTabs = new TabControl();
         _ruleTabs.Dock = DockStyle.Fill;
+        // 先頭に全タブ横断表示の「すべて」タブを固定で置く
+        _allPage = BuildAllPage();
+        _ruleTabs.TabPages.Add(_allPage);
+        _ruleTabs.SelectedIndexChanged += delegate
+        {
+            if (_ruleTabs.SelectedTab == _allPage) RefreshAllGrid();
+        };
 
         // ---- 置換テスト ----
         var prevGrp = new GroupBox();
@@ -315,6 +328,137 @@ class MainForm : Form
         return tab;
     }
 
+    // ---- 「すべて」タブ (全タブ横断表示・検索・ダブルクリックでジャンプ) ----
+
+    // ALLグリッドの各行が、どのタブのどの行に対応するかを覚えておく
+    class AllRowRef
+    {
+        public RuleTab Tab;
+        public DataGridViewRow Row;
+    }
+
+    TabPage BuildAllPage()
+    {
+        var page = new TabPage("すべて"); // Tag=null が「ALLタブ」の目印 (実タブはTagにRuleTab)
+
+        var top = new FlowLayoutPanel();
+        top.Dock = DockStyle.Top;
+        top.Height = 32;
+        var lbl = new Label();
+        lbl.Text = "検索:";
+        lbl.AutoSize = true;
+        lbl.Margin = new Padding(6, 8, 3, 0);
+        _allSearch = new TextBox();
+        _allSearch.Width = 240;
+        _allSearch.Margin = new Padding(3, 4, 3, 0);
+        _allSearch.TextChanged += delegate { RefreshAllGrid(); };
+        var clr = MakeButton("クリア", 60, delegate { _allSearch.Text = ""; });
+        var hint = new Label();
+        hint.Text = "全タブのルールを横断表示 (タブ名・置換前・置換後で検索)。行をダブルクリックすると該当タブの該当行へ移動。ここでは編集できません。";
+        hint.AutoSize = true;
+        hint.ForeColor = Color.Gray;
+        hint.Margin = new Padding(10, 8, 3, 0);
+        top.Controls.Add(lbl);
+        top.Controls.Add(_allSearch);
+        top.Controls.Add(clr);
+        top.Controls.Add(hint);
+
+        _allGrid = new DataGridView();
+        _allGrid.Dock = DockStyle.Fill;
+        _allGrid.ReadOnly = true;
+        _allGrid.AllowUserToAddRows = false;
+        _allGrid.AllowUserToDeleteRows = false;
+        _allGrid.AllowUserToResizeRows = false;
+        _allGrid.RowHeadersVisible = false;
+        _allGrid.MultiSelect = false;
+        _allGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        _allGrid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells;
+        _allGrid.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
+        var cTab = new DataGridViewTextBoxColumn();
+        cTab.HeaderText = "タブ";
+        cTab.Width = 120;
+        var cOn = new DataGridViewTextBoxColumn();
+        cOn.HeaderText = "有効";
+        cOn.Width = 40;
+        cOn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+        var cProb = new DataGridViewTextBoxColumn();
+        cProb.HeaderText = "置換確率(%)";
+        cProb.Width = 84;
+        cProb.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
+        var cFrom = new DataGridViewTextBoxColumn();
+        cFrom.HeaderText = "置換前";
+        cFrom.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        cFrom.FillWeight = 50;
+        var cTo = new DataGridViewTextBoxColumn();
+        cTo.HeaderText = "置換後";
+        cTo.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        cTo.FillWeight = 50;
+        _allGrid.Columns.Add(cTab);
+        _allGrid.Columns.Add(cOn);
+        _allGrid.Columns.Add(cProb);
+        _allGrid.Columns.Add(cFrom);
+        _allGrid.Columns.Add(cTo);
+        _allGrid.CellDoubleClick += OnAllGridDoubleClick;
+
+        page.Controls.Add(_allGrid);
+        page.Controls.Add(top);
+        return page;
+    }
+
+    // ALLグリッドを全タブの現在の内容から作り直す (検索語で絞り込み)
+    void RefreshAllGrid()
+    {
+        if (_allGrid == null) return;
+        string q = (_allSearch.Text ?? "").Trim();
+        _allGrid.Rows.Clear();
+        foreach (TabPage p in _ruleTabs.TabPages)
+        {
+            var t = p.Tag as RuleTab;
+            if (t == null) continue; // ALLタブ自身は除外
+            foreach (DataGridViewRow row in t.Grid.Rows)
+            {
+                if (row.IsNewRow) continue;
+                string from = Convert.ToString(row.Cells[2].Value) ?? "";
+                string to = Convert.ToString(row.Cells[3].Value) ?? "";
+                if (from.Trim().Length == 0 && to.Trim().Length == 0) continue;
+                if (q.Length > 0
+                    && from.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0
+                    && to.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0
+                    && t.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                object on = row.Cells[0].Value;
+                bool ruleOn = !(on is bool) || (bool)on;
+                string prob = Convert.ToString(row.Cells[1].Value) ?? "";
+                int idx = _allGrid.Rows.Add(t.Name, ruleOn ? "✓" : "", prob, from, to);
+                var ar = _allGrid.Rows[idx];
+                ar.Tag = new AllRowRef { Tab = t, Row = row };
+                // タブOFF もしくは ルールOFF は灰色で「効いていない」ことを示す
+                if (!t.Enabled || !ruleOn) ar.DefaultCellStyle.ForeColor = Color.Gray;
+            }
+        }
+    }
+
+    void OnAllGridDoubleClick(object sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0) return;
+        var ar = _allGrid.Rows[e.RowIndex].Tag as AllRowRef;
+        if (ar == null) return;
+        _ruleTabs.SelectedTab = ar.Tab.Page; // 該当タブを前面に
+        try
+        {
+            var g = ar.Tab.Grid;
+            g.ClearSelection();
+            if (!ar.Row.IsNewRow && ar.Row.Index >= 0)
+            {
+                int col = Math.Min(2, g.ColumnCount - 1); // 置換前セルにフォーカス
+                g.CurrentCell = ar.Row.Cells[col];
+                ar.Row.Selected = true;
+                g.FirstDisplayedScrollingRowIndex = ar.Row.Index;
+                g.Focus();
+            }
+        }
+        catch { }
+    }
+
     DataGridView CreateRuleGrid()
     {
         var grid = new DataGridView();
@@ -382,16 +526,26 @@ class MainForm : Form
     {
         foreach (TabPage p in _ruleTabs.TabPages)
         {
-            var t = (RuleTab)p.Tag;
-            if (t.Name == name) return t;
+            var t = p.Tag as RuleTab; // ALLタブは Tag=null なので除外される
+            if (t != null && t.Name == name) return t;
         }
         return null;
     }
 
+    // 実タブ (ALLタブを除く) の枚数
+    int RealTabCount()
+    {
+        int n = 0;
+        foreach (TabPage p in _ruleTabs.TabPages)
+            if (p.Tag is RuleTab) n++;
+        return n;
+    }
+
+    // 現在選択中の実タブ。ALLタブ選択中や未選択なら null
     RuleTab CurrentRuleTab()
     {
         TabPage p = _ruleTabs.SelectedTab;
-        return p == null ? null : (RuleTab)p.Tag;
+        return p == null ? null : p.Tag as RuleTab;
     }
 
     void OnAddTab(object sender, EventArgs e)
@@ -418,7 +572,12 @@ class MainForm : Form
     void OnRenameTab(object sender, EventArgs e)
     {
         var tab = CurrentRuleTab();
-        if (tab == null) return;
+        if (tab == null)
+        {
+            MessageBox.Show(this, "「すべて」タブは名前変更できません。編集したい実タブを選んでください。",
+                "タブ名変更", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
         string name = PromptText(this, "タブ名変更", "タブの名前:", tab.Name);
         if (name == null || name == tab.Name) return;
         if (name.Length == 0)
@@ -440,14 +599,19 @@ class MainForm : Form
 
     void OnDeleteTab(object sender, EventArgs e)
     {
-        if (_ruleTabs.TabPages.Count <= 1)
+        var tab = CurrentRuleTab();
+        if (tab == null)
+        {
+            MessageBox.Show(this, "「すべて」タブは削除できません。削除したい実タブを選んでください。",
+                "タブ削除", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (RealTabCount() <= 1)
         {
             MessageBox.Show(this, "最後のタブは削除できません。", "タブ削除",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
-        var tab = CurrentRuleTab();
-        if (tab == null) return;
         int n = tab.Grid.Rows.Count - (tab.Grid.AllowUserToAddRows ? 1 : 0);
         if (MessageBox.Show(this,
                 "タブ「" + tab.Name + "」とそのルール" + n + "件を削除します。よろしいですか?",
@@ -591,13 +755,47 @@ class MainForm : Form
         _logPath = Path.Combine(Path.GetDirectoryName(_rulesPath), "llm_proxy.log");
         if (_rootBox != null) _rootBox.Text = _root;
         Text = "InstantaleLlmProxy — " + _root;
-        if (save)
-        {
-            try { File.WriteAllText(_configPath, _root, Encoding.UTF8); } catch { }
-        }
+        if (save) WriteConfig();
         LoadRules();
         RefreshStatus();
         RefreshLog();
+    }
+
+    // 前回終了時のウィンドウ位置・サイズを設定ファイルの2行目から復元する。
+    // 画面外に外れている場合 (モニタ構成が変わった等) は既定 (画面中央) のままにする。
+    void ApplySavedWindowBounds(string[] cfgLines)
+    {
+        if (cfgLines == null || cfgLines.Length < 2) return;
+        string[] parts = cfgLines[1].Trim().Split(',');
+        if (parts.Length != 5) return;
+        FormWindowState state;
+        int x, y, w, h;
+        if (!Enum.TryParse<FormWindowState>(parts[0], out state)) return;
+        if (!int.TryParse(parts[1], out x) || !int.TryParse(parts[2], out y) ||
+            !int.TryParse(parts[3], out w) || !int.TryParse(parts[4], out h)) return;
+        if (w < MinimumSize.Width) w = MinimumSize.Width;
+        if (h < MinimumSize.Height) h = MinimumSize.Height;
+        var bounds = new Rectangle(x, y, w, h);
+        bool visible = false;
+        foreach (Screen s in Screen.AllScreens)
+            if (s.WorkingArea.IntersectsWith(bounds)) { visible = true; break; }
+        if (!visible) return;
+        StartPosition = FormStartPosition.Manual;
+        Bounds = bounds;
+        if (state == FormWindowState.Maximized) WindowState = FormWindowState.Maximized;
+    }
+
+    // 対象フォルダと現在のウィンドウ位置・サイズを設定ファイルへ保存する
+    void WriteConfig()
+    {
+        try
+        {
+            Rectangle b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            FormWindowState state = WindowState == FormWindowState.Minimized ? FormWindowState.Normal : WindowState;
+            string line2 = state + "," + b.X + "," + b.Y + "," + b.Width + "," + b.Height;
+            File.WriteAllText(_configPath, _root + "\r\n" + line2, Encoding.UTF8);
+        }
+        catch { }
     }
 
     void OnBrowseRoot(object sender, EventArgs e)
@@ -856,6 +1054,7 @@ class MainForm : Form
     void LoadRules()
     {
         _ruleTabs.TabPages.Clear();
+        _ruleTabs.TabPages.Add(_allPage); // 「すべて」タブは常に先頭に残す
         RuleTab cur = null;
         if (File.Exists(_rulesPath))
         {
@@ -897,10 +1096,12 @@ class MainForm : Form
                     }
                 }
                 if (cur == null) cur = AddRuleTab(DefaultTabName, true); // 旧形式 (タブ行なし)
-                cur.Grid.Rows.Add(enabled, prob.ToString(), from, rest);
+                cur.Grid.Rows.Add(enabled, prob.ToString(),
+                    UnescapeNewlines(from), UnescapeNewlines(rest));
             }
         }
-        if (_ruleTabs.TabPages.Count == 0) AddRuleTab(DefaultTabName, true);
+        if (RealTabCount() == 0) AddRuleTab(DefaultTabName, true);
+        RefreshAllGrid();
         _dirty = false;
     }
 
@@ -939,6 +1140,8 @@ class MainForm : Form
         sb.AppendLine("#   (確率の合計が100を超える場合は 値/合計 の割合で必ずどれかに置換)");
         sb.AppendLine("# ・#tab:タブ名 の行から次のタブ行までが1つのタブ (GUIのタブと連動)");
         sb.AppendLine("# ・#offtab:タブ名 は無効化されたタブ (中のルールはすべて無視)");
+        sb.AppendLine("# ・改行は \\n (2文字) で書く。LLMリクエストのJSON内の改行と一致する形式");
+        sb.AppendLine("#   (GUIのグリッド上では実際の改行として表示・編集される)");
         sb.AppendLine("# ・行頭 # はコメント / UTF-8で保存");
         sb.AppendLine("# ・行頭 #off: は無効化されたルール (GUIの「有効」チェックで切替)");
         sb.AppendLine("# ・変更を保存すると次のLLMリクエストから自動反映 (ゲーム再起動不要)");
@@ -949,7 +1152,8 @@ class MainForm : Form
             sb.AppendLine();
             sb.AppendLine((t.Enabled ? TabPrefix : OffTabPrefix) + t.Name);
             foreach (var r in t.Rules)
-                sb.AppendLine((r.Enabled ? "" : DisabledPrefix) + r.From + "=>" + r.To +
+                sb.AppendLine((r.Enabled ? "" : DisabledPrefix) +
+                              EscapeNewlines(r.From) + "=>" + EscapeNewlines(r.To) +
                               (r.Prob == 100 ? "" : "=>" + r.Prob));
         }
         Directory.CreateDirectory(Path.GetDirectoryName(_rulesPath)); // 新配置のフォルダが無ければ作る
@@ -962,7 +1166,8 @@ class MainForm : Form
         var tabs = new List<TabRules>();
         foreach (TabPage p in _ruleTabs.TabPages)
         {
-            var t = (RuleTab)p.Tag;
+            var t = p.Tag as RuleTab;
+            if (t == null) continue; // ALLタブは保存対象外
             var rules = CollectRules(t, validate);
             if (rules == null) return null;
             tabs.Add(new TabRules { Name = t.Name, Enabled = t.Enabled, Rules = rules });
@@ -1007,8 +1212,9 @@ class MainForm : Form
             if (from == null) from = "";
             if (to == null) to = "";
             probText = probText.Trim();
-            from = from.Trim();
-            to = to.Trim();
+            // 先頭/末尾の改行は意図的に入れている可能性があるので、空白とタブだけ落とす
+            from = from.Trim(' ', '\t');
+            to = to.Trim(' ', '\t');
             if (from.Length == 0 && to.Length == 0) continue;
             int prob = 100; // 未入力は100 (常に置換)
             bool probOk = probText.Length == 0 ||
@@ -1031,15 +1237,23 @@ class MainForm : Form
                     ShowRuleError(tab, row, "「=>」は使用できません。");
                     return null;
                 }
-                if (from.Contains("\n") || to.Contains("\n"))
-                {
-                    ShowRuleError(tab, row, "改行は使用できません。");
-                    return null;
-                }
             }
             rules.Add(new RuleEntry { Enabled = enabled, Prob = prob, From = from, To = to });
         }
         return rules;
+    }
+
+    // グリッド上は実際の改行で表示・編集し、ファイル上は \n (2文字) で保持する。
+    // プロキシはJSONボディを生テキストのまま置換するので、ファイル側の \n が
+    // JSON文字列内の改行エスケープにそのまま一致する。
+    static string EscapeNewlines(string s)
+    {
+        return s.Replace("\r\n", "\\n").Replace("\r", "\\n").Replace("\n", "\\n");
+    }
+
+    static string UnescapeNewlines(string s)
+    {
+        return s.Replace("\\n", "\r\n");
     }
 
     void ShowRuleError(RuleTab tab, DataGridViewRow row, string msg)
@@ -1109,9 +1323,10 @@ class MainForm : Form
             if (r == DialogResult.Yes)
             {
                 SaveRules();
-                if (_dirty) e.Cancel = true; // 保存失敗時は閉じない
+                if (_dirty) { e.Cancel = true; return; } // 保存失敗時は閉じない
             }
         }
+        WriteConfig();
     }
 
     // ---------------------------------------------------------------- ログ

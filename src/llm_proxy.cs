@@ -9,6 +9,13 @@
 //   llm_replacements.txt のルールで置換して中継する。
 //   レスポンス(ストリーミング含む)は無加工でそのまま流す。
 //
+// JSON安定化 (JSONFIX):
+//   /completion のプロンプト内にPython dict形式のJSONスキーマを検出したら、
+//   本物のJSON Schemaへ変換して llama-server の json_schema パラメータに注入する。
+//   これによりサーバ側の文法制約付き生成が働き、構文的に壊れたJSONが
+//   出力されなくなる。詳細は「JSON安定化」セクションを参照。
+//   無効化するにはMODフォルダに llm_proxy_jsonfix_off.txt を置く。
+//
 // ルールファイル: <MODフォルダ>\llm_replacements.txt (UTF-8)
 //   MODフォルダの場所は、適用時に exe と同じ場所に書かれる llm_proxy_dir.txt で
 //   確実に特定する。無い場合のみ後方互換で上位フォルダから探索する。
@@ -30,7 +37,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -325,6 +334,8 @@ static class LlmProxy
         }
 
         byte[] newBody = contentLength > 0 ? ApplyRules(body, reqLine) : body;
+        if (newBody.Length > 0 && IsCompletionRequest(reqLine))
+            newBody = ApplyJsonSchemaFix(newBody, reqLine);
         if (!ReferenceEquals(newBody, body))
         {
             // ボディが変わったので Content-Length を書き換えてヘッダを再構築
@@ -619,6 +630,441 @@ static class LlmProxy
         }
         return null;
     }
+
+    // ---------------------------------------------------------------- JSON安定化
+    // ゲームはLLMにJSON形式での出力を指示するが、素のLLM出力は壊れたJSONに
+    // なりやすい (Python表記のTrue/None混入、カッコ閉じ忘れ、コードブロック等)。
+    // /completion リクエストのプロンプト内に埋め込まれたPython dict形式の
+    // スキーマを検出・変換し、llama-server の json_schema パラメータとして
+    // 注入することで、文法制約付き生成により構文的に正しいJSONだけが
+    // 出力されるようにする。
+    // ・プロンプト内のPython表記スキーマも本物のJSON表記に置き換える
+    // ・スキーマの解析に失敗した場合は汎用JSON文法(GBNF)で最低限の構文を保証
+    // ・ゲーム側が既に json_schema / grammar を指定している場合は何もしない
+    // ・スキーマ指示の無いリクエスト (自由文ナレーション等) には作用しない
+    // ・無効化したい場合はMODフォルダに llm_proxy_jsonfix_off.txt を置く
+
+    const string JsonFixOffFileName = "llm_proxy_jsonfix_off.txt";
+    const string DiagOnFileName = "llm_proxy_diag_on.txt";
+
+    static bool JsonFixEnabled()
+    {
+        try
+        {
+            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                : Path.GetDirectoryName(_logPath);
+            if (baseDir == null) return true;
+            return !File.Exists(Path.Combine(baseDir, JsonFixOffFileName));
+        }
+        catch { return true; }
+    }
+
+    // 調査用の[DIAG]ログ/スキーマダンプはデフォルトOFF。実際に不具合を目撃したときだけ
+    // MODフォルダに llm_proxy_diag_on.txt を置いて再度有効化する (通常運用でログを汚さない)
+    static bool DiagEnabled()
+    {
+        try
+        {
+            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                : Path.GetDirectoryName(_logPath);
+            if (baseDir == null) return false;
+            return File.Exists(Path.Combine(baseDir, DiagOnFileName));
+        }
+        catch { return false; }
+    }
+
+    static long ToLong(object o)
+    {
+        if (o is long) return (long)o;
+        if (o is double) return (long)(double)o;
+        return -1;
+    }
+
+    static readonly object SchemaDumpLock = new object();
+
+    // 診断用: ゲームが実際に送ってきた json_schema の中身をそのまま別ファイルに追記する。
+    // n_predict値とprompt文字数も併記し、「打ち切りで壊れているのか」「スキーマ自体が
+    // 複雑すぎて変換に失敗しているのか」を後から突き合わせられるようにする。
+    // 調査用の一時コードであり、通常運用では読まなくてよい。
+    static void DumpSchema(string reqLine, object schema, long nPredict, string prompt)
+    {
+        try
+        {
+            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                : Path.GetDirectoryName(_logPath);
+            if (baseDir == null) return;
+            string path = Path.Combine(baseDir, "llm_proxy_schema_dump.log");
+            string schemaJson;
+            try { schemaJson = JsonSerialize(schema); }
+            catch (Exception ex) { schemaJson = "(シリアライズ失敗: " + ex.Message + ")"; }
+            var sb = new StringBuilder();
+            sb.Append("==== ").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"))
+              .Append(" ").Append(reqLine)
+              .Append(" | n_predict=").Append(nPredict)
+              .Append(" | prompt文字数=").Append(prompt != null ? prompt.Length : -1)
+              .Append(" ====\r\n");
+            sb.Append(schemaJson).Append("\r\n\r\n");
+            lock (SchemaDumpLock)
+            {
+                File.AppendAllText(path, sb.ToString(), new UTF8Encoding(false));
+                var fi = new FileInfo(path);
+                if (fi.Exists && fi.Length > 20 * 1024 * 1024) fi.Delete(); // 肥大化防止
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("[DIAG] スキーマダンプ失敗: " + ex.Message);
+        }
+    }
+
+    static bool IsCompletionRequest(string reqLine)
+    {
+        if (!reqLine.StartsWith("POST ", StringComparison.Ordinal)) return false;
+        int sp = reqLine.IndexOf(' ', 5);
+        string path = sp > 0 ? reqLine.Substring(5, sp - 5) : reqLine.Substring(5);
+        int q = path.IndexOf('?');
+        if (q >= 0) path = path.Substring(0, q);
+        return path == "/completion" || path == "/completions" || path == "/v1/completions";
+    }
+
+    internal static byte[] ApplyJsonSchemaFix(byte[] body, string reqLine)
+    {
+        try
+        {
+            if (!JsonFixEnabled()) return body;
+            string text;
+            try { text = new UTF8Encoding(false, true).GetString(body); }
+            catch { return body; } // バイナリはそのまま
+
+            int pos = 0;
+            object rootObj;
+            try { rootObj = ParseLiteral(text, ref pos); }
+            catch { return body; } // JSONとして読めないボディは触らない
+            OrderedDictionary root = rootObj as OrderedDictionary;
+            if (root == null) return body;
+
+            // 診断用: ゲームが実際に送ってきたリクエストのトップレベルキー一覧やスキーマ本体を記録する。
+            // json_schema/grammar をゲーム側が既に指定しているかどうかの実地調査用。
+            // 通常運用ではログを汚さないよう、MODフォルダに llm_proxy_diag_on.txt がある時だけ動く。
+            if (DiagEnabled())
+            {
+                var keyNames = new List<string>();
+                foreach (System.Collections.DictionaryEntry e in root) keyNames.Add((string)e.Key);
+                long nPredictDiag = root.Contains("n_predict") ? ToLong(root["n_predict"]) : -1;
+                string promptDiag = root.Contains("prompt") ? root["prompt"] as string : null;
+                Log("[DIAG] " + reqLine + " | 受信キー: " + string.Join(", ", keyNames.ToArray()) +
+                    " | n_predict=" + nPredictDiag +
+                    " | prompt文字数=" + (promptDiag != null ? promptDiag.Length : -1));
+                if (root.Contains("json_schema"))
+                    DumpSchema(reqLine, root["json_schema"], nPredictDiag, promptDiag);
+            }
+
+            if (root.Contains("json_schema") || root.Contains("grammar")) return body;
+            string prompt = root.Contains("prompt") ? root["prompt"] as string : null;
+            if (prompt == null) return body;
+
+            int schemaStart = FindSchemaStart(prompt);
+            if (schemaStart < 0) return body; // JSON出力を要求しないリクエスト
+
+            object schema = null;
+            int schemaEnd = schemaStart;
+            try
+            {
+                int p = schemaStart;
+                schema = ParseLiteral(prompt, ref p);
+                schemaEnd = p;
+            }
+            catch { schema = null; }
+
+            if (schema is OrderedDictionary)
+            {
+                string schemaJson = JsonSerialize(schema);
+                // プロンプト内のPython表記スキーマも本物のJSON表記に揃える
+                root["prompt"] = prompt.Substring(0, schemaStart) + schemaJson +
+                                 prompt.Substring(schemaEnd);
+                root["json_schema"] = schema;
+                Log("[JSONFIX] " + reqLine + " | json_schemaを注入 (" + schemaJson.Length + "文字)");
+            }
+            else
+            {
+                // スキーマらしき部分はあるが解析できない → 最低限の構文だけ保証
+                root["grammar"] = GenericJsonGrammar;
+                Log("[JSONFIX] " + reqLine + " | スキーマ解析失敗のため汎用JSON文法を注入");
+            }
+            return Encoding.UTF8.GetBytes(JsonSerialize(root));
+        }
+        catch (Exception ex)
+        {
+            Log("[JSONFIX] 失敗のため無加工で中継: " + ex.Message);
+            return body;
+        }
+    }
+
+    // プロンプト内のスキーマ開始位置。Python表記/JSON表記のどちらでも検出する
+    static readonly string[] SchemaMarkers =
+    {
+        "{'$defs':", "{'properties':", "{\"$defs\":", "{\"properties\":"
+    };
+
+    static int FindSchemaStart(string prompt)
+    {
+        int best = -1;
+        foreach (string m in SchemaMarkers)
+        {
+            int i = prompt.IndexOf(m, StringComparison.Ordinal);
+            if (i >= 0 && (best < 0 || i < best)) best = i;
+        }
+        return best;
+    }
+
+    // JSONとPythonリテラル (dict/list/tuple/str/数値/True/False/None) の両方を
+    // 同じ文法のスーパーセットとして解析する。dictはOrderedDictionary (キー順保持)。
+    internal static object ParseLiteral(string s, ref int i)
+    {
+        SkipWs(s, ref i);
+        if (i >= s.Length) throw new FormatException("入力の末尾に到達");
+        char c = s[i];
+        if (c == '{')
+        {
+            var d = new OrderedDictionary();
+            i++;
+            SkipWs(s, ref i);
+            if (i < s.Length && s[i] == '}') { i++; return d; }
+            while (true)
+            {
+                string key = ParseLiteral(s, ref i) as string;
+                if (key == null) throw new FormatException("dictのキーが文字列でない");
+                SkipWs(s, ref i);
+                if (i >= s.Length || s[i] != ':') throw new FormatException("':'が無い");
+                i++;
+                d[key] = ParseLiteral(s, ref i);
+                SkipWs(s, ref i);
+                if (i >= s.Length) throw new FormatException("'}'が無い");
+                if (s[i] == ',')
+                {
+                    i++;
+                    SkipWs(s, ref i);
+                    if (i < s.Length && s[i] == '}') { i++; return d; } // 末尾カンマ許容
+                    continue;
+                }
+                if (s[i] == '}') { i++; return d; }
+                throw new FormatException("dictの区切りが不正: pos=" + i);
+            }
+        }
+        if (c == '[' || c == '(')
+        {
+            char close = c == '[' ? ']' : ')';
+            var list = new List<object>();
+            i++;
+            SkipWs(s, ref i);
+            if (i < s.Length && s[i] == close) { i++; return list; }
+            while (true)
+            {
+                list.Add(ParseLiteral(s, ref i));
+                SkipWs(s, ref i);
+                if (i >= s.Length) throw new FormatException("リストが閉じない");
+                if (s[i] == ',')
+                {
+                    i++;
+                    SkipWs(s, ref i);
+                    if (i < s.Length && s[i] == close) { i++; return list; }
+                    continue;
+                }
+                if (s[i] == close) { i++; return list; }
+                throw new FormatException("リストの区切りが不正: pos=" + i);
+            }
+        }
+        if (c == '\'' || c == '"') return ParseQuotedString(s, ref i);
+        if (MatchWord(s, i, "True")) { i += 4; return true; }
+        if (MatchWord(s, i, "False")) { i += 5; return false; }
+        if (MatchWord(s, i, "None")) { i += 4; return null; }
+        if (MatchWord(s, i, "true")) { i += 4; return true; }
+        if (MatchWord(s, i, "false")) { i += 5; return false; }
+        if (MatchWord(s, i, "null")) { i += 4; return null; }
+        if (c == '-' || c == '+' || (c >= '0' && c <= '9')) return ParseNumber(s, ref i);
+        throw new FormatException("不明なリテラル: pos=" + i);
+    }
+
+    static void SkipWs(string s, ref int i)
+    {
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') i++;
+            else break;
+        }
+    }
+
+    static bool MatchWord(string s, int i, string w)
+    {
+        if (i + w.Length > s.Length) return false;
+        if (string.CompareOrdinal(s, i, w, 0, w.Length) != 0) return false;
+        int e = i + w.Length;
+        if (e < s.Length)
+        {
+            char n = s[e];
+            if (char.IsLetterOrDigit(n) || n == '_') return false;
+        }
+        return true;
+    }
+
+    static string ParseQuotedString(string s, ref int i)
+    {
+        char q = s[i];
+        i++;
+        var sb = new StringBuilder();
+        while (true)
+        {
+            if (i >= s.Length) throw new FormatException("文字列が閉じない");
+            char c = s[i];
+            if (c == q) { i++; return sb.ToString(); }
+            if (c == '\\')
+            {
+                if (i + 1 >= s.Length) throw new FormatException("エスケープが不完全");
+                char e = s[i + 1];
+                switch (e)
+                {
+                    case 'n': sb.Append('\n'); i += 2; break;
+                    case 't': sb.Append('\t'); i += 2; break;
+                    case 'r': sb.Append('\r'); i += 2; break;
+                    case 'b': sb.Append('\b'); i += 2; break;
+                    case 'f': sb.Append('\f'); i += 2; break;
+                    case '0': sb.Append('\0'); i += 2; break;
+                    case 'x':
+                        if (i + 3 >= s.Length) throw new FormatException("\\xが不完全");
+                        sb.Append((char)Convert.ToInt32(s.Substring(i + 2, 2), 16));
+                        i += 4;
+                        break;
+                    case 'u':
+                        if (i + 5 >= s.Length) throw new FormatException("\\uが不完全");
+                        sb.Append((char)Convert.ToInt32(s.Substring(i + 2, 4), 16));
+                        i += 6;
+                        break;
+                    default: sb.Append(e); i += 2; break; // \' \" \\ \/ など
+                }
+                continue;
+            }
+            sb.Append(c);
+            i++;
+        }
+    }
+
+    static object ParseNumber(string s, ref int i)
+    {
+        int start = i;
+        if (i < s.Length && (s[i] == '-' || s[i] == '+')) i++;
+        bool isDouble = false;
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c >= '0' && c <= '9') { i++; continue; }
+            if (c == '.' || c == 'e' || c == 'E') { isDouble = true; i++; continue; }
+            if ((c == '-' || c == '+') && (s[i - 1] == 'e' || s[i - 1] == 'E')) { i++; continue; }
+            break;
+        }
+        string num = s.Substring(start, i - start);
+        if (!isDouble)
+        {
+            long l;
+            if (long.TryParse(num, NumberStyles.Integer, CultureInfo.InvariantCulture, out l))
+                return l;
+        }
+        return double.Parse(num, NumberStyles.Float, CultureInfo.InvariantCulture);
+    }
+
+    internal static string JsonSerialize(object o)
+    {
+        var sb = new StringBuilder(4096);
+        WriteJson(o, sb);
+        return sb.ToString();
+    }
+
+    static void WriteJson(object o, StringBuilder sb)
+    {
+        if (o == null) { sb.Append("null"); return; }
+        if (o is bool) { sb.Append((bool)o ? "true" : "false"); return; }
+        string str = o as string;
+        if (str != null) { WriteJsonString(str, sb); return; }
+        if (o is long) { sb.Append(((long)o).ToString(CultureInfo.InvariantCulture)); return; }
+        if (o is int) { sb.Append(((int)o).ToString(CultureInfo.InvariantCulture)); return; }
+        if (o is double)
+        {
+            double d = (double)o;
+            if (d == Math.Floor(d) && !double.IsInfinity(d) && Math.Abs(d) < 9e15)
+                sb.Append(((long)d).ToString(CultureInfo.InvariantCulture));
+            else
+                sb.Append(d.ToString("R", CultureInfo.InvariantCulture));
+            return;
+        }
+        OrderedDictionary od = o as OrderedDictionary;
+        if (od != null)
+        {
+            sb.Append('{');
+            bool first = true;
+            foreach (System.Collections.DictionaryEntry e in od)
+            {
+                if (!first) sb.Append(',');
+                first = false;
+                WriteJsonString((string)e.Key, sb);
+                sb.Append(':');
+                WriteJson(e.Value, sb);
+            }
+            sb.Append('}');
+            return;
+        }
+        System.Collections.IEnumerable en = o as System.Collections.IEnumerable;
+        if (en != null)
+        {
+            sb.Append('[');
+            bool first = true;
+            foreach (object item in en)
+            {
+                if (!first) sb.Append(',');
+                first = false;
+                WriteJson(item, sb);
+            }
+            sb.Append(']');
+            return;
+        }
+        throw new InvalidOperationException("シリアライズ不能な型: " + o.GetType());
+    }
+
+    // 非ASCIIはすべて\uXXXXにエスケープする (出力ボディをASCII安全にするため)
+    static void WriteJsonString(string s, StringBuilder sb)
+    {
+        sb.Append('"');
+        foreach (char c in s)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                case '\b': sb.Append("\\b"); break;
+                case '\f': sb.Append("\\f"); break;
+                default:
+                    if (c < 0x20 || c > 0x7e)
+                        sb.Append("\\u").Append(((int)c).ToString("x4"));
+                    else
+                        sb.Append(c);
+                    break;
+            }
+        }
+        sb.Append('"');
+    }
+
+    // llama.cpp 付属の json.gbnf 相当。スキーマ変換に失敗したときの保険で、
+    // 少なくとも「構文的に正しいJSONオブジェクト」だけを出力させる
+    const string GenericJsonGrammar =
+        "root   ::= object\n" +
+        "value  ::= object | array | string | number | (\"true\" | \"false\" | \"null\") ws\n" +
+        "object ::= \"{\" ws ( string \":\" ws value (\",\" ws string \":\" ws value)* )? \"}\" ws\n" +
+        "array  ::= \"[\" ws ( value (\",\" ws value)* )? \"]\" ws\n" +
+        "string ::= \"\\\"\" ( [^\"\\\\\\x7F\\x00-\\x1F] | \"\\\\\" ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) )* \"\\\"\" ws\n" +
+        "number ::= (\"-\"? ([0-9] | [1-9] [0-9]{0,15})) (\".\" [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws\n" +
+        "ws     ::= | \" \" | \"\\n\" [ \\t]{0,20}\n";
 
     // ---------------------------------------------------------------- ユーティリティ
 
