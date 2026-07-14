@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // llm_proxy_gui.cs — InstantaleLlmProxy 管理GUI
 //
 // 配置: MODフォルダ直下に InstantaleLlmProxy.exe、ソース類は src\ 配下。
@@ -37,6 +37,10 @@ static class Program
 
 class MainForm : Form
 {
+    // ゲームが同梱する llama.cpp のバックエンド別フォルダ (bin\ の下)。
+    // どれが使われるかは実行環境次第なので、適用/解除は3つすべてに対して行う。
+    // ゲーム側の llama.cpp が更新されるとフォルダ名 (b7054の部分) が変わるので、
+    // 「フォルダなし」表示になったらここを更新する。BackendNamesとは添字で対応。
     static readonly string[] BackendDirs =
     {
         "llama-b7054-bin-win-cpu-x64",
@@ -459,6 +463,10 @@ class MainForm : Form
         catch { }
     }
 
+    // ルール編集グリッドを1枚作る。列の並びは
+    //   0=有効(チェック) / 1=置換確率(%) / 2=置換前 / 3=置換後
+    // で固定。CollectRules や RefreshAllGrid はこの添字を直接使うので、
+    // 列を増減・入れ替えする場合はそちらも合わせて直すこと。
     DataGridView CreateRuleGrid()
     {
         var grid = new DataGridView();
@@ -820,6 +828,9 @@ class MainForm : Form
 
     // ---------------------------------------------------------------- 状態表示
 
+    // 2秒ごとのタイマーからも呼ばれる。
+    // 適用済みかどうかは llama-server-real.exe (退避された本物) の有無で判断する:
+    // 本物が退避されている = llama-server.exe はラッパーに差し替わっている、とみなせる
     void RefreshStatus()
     {
         for (int i = 0; i < BackendDirs.Length; i++)
@@ -863,6 +874,9 @@ class MainForm : Form
 
     // ---------------------------------------------------------------- 適用/解除/終了
 
+    // ラッパーをビルドし、各バックエンドの llama-server.exe と差し替える。
+    // exeを掴んだままのプロセスがあると差し替えに失敗するので、先に終了させる。
+    // 本物の退避は初回だけ (2回目以降にmoveすると、退避先がラッパーで上書きされて本物を失う)
     void OnApply(object sender, EventArgs e)
     {
         if (!EnsureNoProcess("MODを適用")) return;
@@ -926,6 +940,8 @@ class MainForm : Form
         }
     }
 
+    // ラッパーを消して、退避しておいた本物を llama-server.exe の名前に戻す。
+    // これでゲームは何も知らずにオリジナルのサーバを起動するようになる
     void OnRevert(object sender, EventArgs e)
     {
         if (!EnsureNoProcess("MODを解除")) return;
@@ -1005,6 +1021,9 @@ class MainForm : Form
         return true;
     }
 
+    // llm_proxy.cs をその場でコンパイルする。
+    // cscはWindows同梱の .NET Framework 4.x のものを直接叩くので、
+    // 開発環境やSDKのインストールは不要 (ユーザのPCでもそのままビルドできる)
     bool BuildWrapper(out string output)
     {
         string csc = Path.Combine(
@@ -1028,8 +1047,8 @@ class MainForm : Form
 
     // ---------------------------------------------------------------- ルール編集
 
-    // \u30B0\u30EA\u30C3\u30C91\u884C\u5206\u306E\u30EB\u30FC\u30EB\u3002Enabled=false \u306F\u300C#off:\u300D\u4ED8\u304D\u3067\u30D5\u30A1\u30A4\u30EB\u306B\u4FDD\u5B58\u3055\u308C\u3001
-    // \u30D7\u30ED\u30AD\u30B7\u5074\u304B\u3089\u306F\u30B3\u30E1\u30F3\u30C8\u884C\u3068\u3057\u3066\u7121\u8996\u3055\u308C\u308B (\u30D7\u30ED\u30AD\u30B7\u306E\u5909\u66F4\u4E0D\u8981)
+    // グリッド1行分のルール。Enabled=false は「#off:」付きでファイルに保存され、
+    // プロキシ側からはコメント行として無視される (プロキシの変更不要)
     class RuleEntry
     {
         public bool Enabled;
@@ -1051,6 +1070,8 @@ class MainForm : Form
     const string OffTabPrefix = "#offtab:"; // 無効化されたタブのセクション行
     const string DefaultTabName = "標準";   // タブ行が無い旧形式ファイル用
 
+    // ルールファイルを読んでタブとグリッドを作り直す。
+    // ファイルが無い/読めない場合も空のタブ1枚で始められるようにする
     void LoadRules()
     {
         _ruleTabs.TabPages.Clear();
@@ -1128,7 +1149,10 @@ class MainForm : Form
         }
     }
 
-    // 対象フォルダの llm_replacements.txt にルールを書き出す
+    // 対象フォルダの llm_replacements.txt にルールを書き出す。
+    // 追記ではなくファイル全体を書き直すので、手書きで足したコメント行は消える
+    // (先頭の説明コメントは毎回ここで生成し直している)。
+    // プロキシは書き込み時刻の変化を見て自動再読込するため、保存＝即反映になる
     void WriteRulesFile(List<TabRules> tabs)
     {
         var sb = new StringBuilder();

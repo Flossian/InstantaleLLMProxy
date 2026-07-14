@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // llm_proxy.cs — Instantale LLMリクエスト置換プロキシ (llama-server.exe ラッパー)
 //
 // 仕組み:
@@ -79,8 +79,12 @@ static class LlmProxy
     static Process _child;
     static IntPtr _job = IntPtr.Zero;
 
+    // 起動直後の唯一の関心事はログの出力先を確定させること。
+    // ここから先の失敗はすべてログに残したいので、Runに入る前に _logPath を決める。
     static int Main(string[] args)
     {
+        // カレントディレクトリはゲーム側の都合で決まるため当てにできない。
+        // 基準は常に「このexeが置かれている場所」(= bin\llama-*\) とする。
         string exeDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
 
         // ルールファイルの場所を特定する (適用時のマーカー優先、無ければ後方互換の探索)
@@ -125,6 +129,8 @@ static class LlmProxy
         }
     }
 
+    // ゲームから渡された引数をそのまま本物へ引き継ぎつつ、ポートだけを差し替える。
+    // ゲームが繋ぎに来るポート(listenPort)でこちらが待ち受け、本物は内部ポート(_upstreamPort)へ追いやる。
     static int Run(string exeDir, string rulesPath, string[] args)
     {
         _exeDir = exeDir;
@@ -299,6 +305,8 @@ static class LlmProxy
         byte[] header = ReadHeaderBlock(reader);
         if (header == null) return false; // クライアント切断
 
+        // ヘッダはLatin-1 (28591) で文字列化する。1バイト=1文字が保証され、
+        // 解析だけしてそのまま書き戻してもバイト列が壊れない (UTF-8だと非ASCIIで崩れる)
         string headerText = Encoding.GetEncoding(28591).GetString(header);
         string[] lines = headerText.Split(new[] { "\r\n" }, StringSplitOptions.None);
         string reqLine = lines[0];
@@ -324,6 +332,7 @@ static class LlmProxy
             return false;
         }
 
+        // Content-Length分を読み切る (1回のReadでは足りないことがある)
         byte[] body = new byte[contentLength];
         int off = 0;
         while (off < contentLength)
@@ -333,6 +342,7 @@ static class LlmProxy
             off += n;
         }
 
+        // 加工の有無は参照の同一性で判定する。無加工なら元のヘッダをそのまま流せる
         byte[] newBody = contentLength > 0 ? ApplyRules(body, reqLine) : body;
         if (newBody.Length > 0 && IsCompletionRequest(reqLine))
             newBody = ApplyJsonSchemaFix(newBody, reqLine);
@@ -364,10 +374,12 @@ static class LlmProxy
         return true;
     }
 
-    // \r\n\r\n までを読み取る。開始前にEOFなら null
+    // \r\n\r\n までを読み取る。開始前にEOFなら null (keep-aliveの正常な終了)
     static byte[] ReadHeaderBlock(Stream s)
     {
         var buf = new List<byte>(1024);
+        // ヘッダ終端 \r\n\r\n を1バイトずつ追う状態機械。
+        // state: 0=何もなし 1=\r 2=\r\n 3=\r\n\r → 次が \n なら終端
         int state = 0;
         while (true)
         {
@@ -381,10 +393,13 @@ static class LlmProxy
                 state = (state == 1) ? 2 : 0;
             }
             else state = 0;
+            // 終端が来ないまま無限にメモリを食うのを防ぐ (壊れたクライアント対策)
             if (buf.Count > 1024 * 1024) throw new InvalidOperationException("ヘッダが大きすぎます");
         }
     }
 
+    // 無加工の一方向中継。レスポンス(本物→ゲーム)はこれで流す。
+    // トークンが生成されるそばから届くよう、溜めずに読めた分だけ即書き出す
     static void PipeRaw(TcpClient src, TcpClient dst)
     {
         try
@@ -420,7 +435,8 @@ static class LlmProxy
     static List<Rule> LoadRules(string path)
     {
         var rules = new List<Rule>();
-        // \u30BF\u30D6\u30BB\u30AF\u30B7\u30E7\u30F3: \u300C#tab:\u540D\u524D\u300D\u4EE5\u964D\u306F\u6709\u52B9\u30BF\u30D6\u3001\u300C#offtab:\u540D\u524D\u300D\u4EE5\u964D\u306F\u7121\u52B9\u30BF\u30D6 (\u4E2D\u306E\u30EB\u30FC\u30EB\u3092\u7121\u8996)
+        // タブセクション: 「#tab:名前」以降は有効タブ、「#offtab:名前」以降は無効タブ (中のルールを無視)。
+        // タブ行が1つも無い旧形式のファイルは、全行が有効として読まれる。
         bool tabEnabled = true;
         foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
         {
@@ -673,6 +689,7 @@ static class LlmProxy
         catch { return false; }
     }
 
+    // 診断ログ用に数値を取り出す。キーが無い/数値でない場合は -1 (「不明」の意味)
     static long ToLong(object o)
     {
         if (o is long) return (long)o;
@@ -717,6 +734,8 @@ static class LlmProxy
         }
     }
 
+    // JSONFIXの対象は生成リクエストだけ。/apply-template などの前処理には触らない。
+    // リクエスト行「POST /completion HTTP/1.1」からパス部分だけを取り出して判定する
     static bool IsCompletionRequest(string reqLine)
     {
         if (!reqLine.StartsWith("POST ", StringComparison.Ordinal)) return false;
@@ -895,6 +914,8 @@ static class LlmProxy
         }
     }
 
+    // 位置iがちょうど単語wか。直後が英数字/_ なら別の識別子の一部とみなして不一致にする
+    // (例: "None" と "NoneOfThem" を取り違えない)
     static bool MatchWord(string s, int i, string w)
     {
         if (i + w.Length > s.Length) return false;
@@ -908,6 +929,8 @@ static class LlmProxy
         return true;
     }
 
+    // 引用符はシングル/ダブルの両方を受け付ける (Python表記のdictは 'key' を使う)。
+    // エスケープもJSONの範囲に加えてPython固有の \x41 や \' まで解釈する
     static string ParseQuotedString(string s, ref int i)
     {
         char q = s[i];
@@ -949,6 +972,8 @@ static class LlmProxy
         }
     }
 
+    // 整数は long、小数点や指数を含むものは double で返す。
+    // スキーマ中の maxLength などを 3.0 のような形に変えないため、整数はlongのまま保つ
     static object ParseNumber(string s, ref int i)
     {
         int start = i;
@@ -1068,6 +1093,8 @@ static class LlmProxy
 
     // ---------------------------------------------------------------- ユーティリティ
 
+    // ポート0でbindするとOSが空きポートを割り当てる。すぐ閉じて番号だけ使う
+    // (閉じてから本物が掴むまでの間に他プロセスに奪われる可能性は残るが、実用上問題にならない)
     static int FindFreePort()
     {
         var l = new TcpListener(IPAddress.Loopback, 0);
@@ -1077,6 +1104,8 @@ static class LlmProxy
         return p;
     }
 
+    // 複数スレッド (接続ごと) から呼ばれるので追記は直列化する。
+    // ログ出力の失敗でゲームを止めたくないので、例外はすべて握り潰す
     static void Log(string msg)
     {
         try
@@ -1106,6 +1135,8 @@ static class LlmProxy
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
 
+    // 以下2つの構造体はWin32のヘッダ定義と1バイトも違わない必要がある。
+    // フィールドの型・順序を変えると SetInformationJobObject が黙って失敗する
     [StructLayout(LayoutKind.Sequential)]
     struct JOBOBJECT_BASIC_LIMIT_INFORMATION
     {
@@ -1142,9 +1173,13 @@ static class LlmProxy
         public UIntPtr PeakJobMemoryUsed;
     }
 
+    // Jobのハンドルが閉じられた時 (= ラッパー終了時) に中のプロセスを全て終了させるフラグ。
+    // プロセスがkillされてもハンドルはOSが閉じるので、強制終了でも本物が道連れになる
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
     const int JobObjectExtendedLimitInformation = 9;
 
+    // 失敗しても中継自体は続行できるので、警告ログだけ残して先へ進む
+    // (最悪、本物がゲーム終了後も残るが、GUIの「プロセス強制終了」で回収できる)
     static void SetupJobObject(Process child)
     {
         try
