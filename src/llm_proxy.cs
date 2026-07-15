@@ -939,7 +939,7 @@ static class LlmProxy
                 if (stamp == _rulesStamp) return;
                 Rules = LoadRules(_rulesPath);
                 _rulesStamp = stamp;
-                Log("[RULES] 読込: " + _rulesPath + " " + Rules.Count + "パターン(エスケープ版含む)");
+                LogDebug("[RULES] 読込: " + _rulesPath + " " + Rules.Count + "パターン(エスケープ版含む)");
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
@@ -983,7 +983,7 @@ static class LlmProxy
             foreach (var r in g) total += r.Prob;
             if (total <= 0)
             {
-                Log("[SKIP] " + reqLine + " | \"" + Snip(g[0].DispFrom) + "\" 確率0のため置換せず");
+                LogDebug("[SKIP] " + reqLine + " | \"" + Snip(g[0].DispFrom) + "\" 確率0のため置換せず");
                 continue;
             }
             int denom = Math.Max(total, 100);
@@ -998,13 +998,13 @@ static class LlmProxy
             }
             if (chosen == null)
             {
-                Log("[SKIP] " + reqLine + " | \"" + Snip(g[0].DispFrom) + "\" 確率判定により置換せず (" +
+                LogDebug("[SKIP] " + reqLine + " | \"" + Snip(g[0].DispFrom) + "\" 確率判定により置換せず (" +
                     total + "/" + denom + ")");
                 continue;
             }
             text = text.Replace(chosen.From, chosen.To);
             changed = true;
-            Log("[REPLACE] " + reqLine + " | \"" + Snip(chosen.DispFrom) + "\" -> \"" + Snip(chosen.DispTo) +
+            LogDebug("[REPLACE] " + reqLine + " | \"" + Snip(chosen.DispFrom) + "\" -> \"" + Snip(chosen.DispTo) +
                 "\" (確率" + chosen.Prob + "/" + denom + ")");
         }
         return changed ? Encoding.UTF8.GetBytes(text) : body;
@@ -1091,6 +1091,7 @@ static class LlmProxy
     const string DedupOffFileName = "llm_proxy_dedup_off.txt";
     const string SingletonOffFileName = "llm_proxy_singleton_off.txt";
     const string DiagOnFileName = "llm_proxy_diag_on.txt";
+    const string SettingsFileName = "llm_proxy_settings.ini";
 
     static bool JsonFixEnabled()
     {
@@ -1113,6 +1114,91 @@ static class LlmProxy
                                                 : Path.GetDirectoryName(_logPath);
             if (baseDir == null) return true;
             return !File.Exists(Path.Combine(baseDir, DedupOffFileName));
+        }
+        catch { return true; }
+    }
+
+    // プロンプト内スキーマ説明のコンパクト化はデフォルトON。GUIの「プロンプト圧縮」チェックボックスで
+    // ON/OFFすると llm_proxy_settings.ini (INI形式) の schema_compact キーに書かれ、ここで読む。
+    // json_schema(grammar制約)が既に付いているリクエストが対象なので、構造の正しさ
+    // 自体は圧縮の有無に関係なく保証される(grammarがトークン単位で強制する)。圧縮で削るのは
+    // フィールドの意味づけを助ける説明的な冗長部分だけ。
+    static bool SchemaCompactEnabled()
+    {
+        return ReadSettingBool("schema_compact", true);
+    }
+
+    // llm_proxy_settings.ini から key=value 形式の設定値を読む (キー無し/ファイル無しは既定値)。
+    // ルールファイルと同じ考え方で、リクエストのたびに読み直す(数行のテキストなので負荷は無視できる)。
+    // 大文字小文字は区別せず、値は 1/0, true/false, on/off のいずれでも受け付ける。
+    static bool ReadSettingBool(string key, bool dflt)
+    {
+        string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                            : Path.GetDirectoryName(_logPath);
+        return ReadSettingBool(baseDir, key, dflt);
+    }
+
+    // baseDir を明示的に取る版。本体は上のオーバーロードから呼ばれるほか、
+    // テストからも(実行時グローバル状態に触れずに)直接呼べるよう internal にしてある。
+    // INIのセクション見出し([Settings]等)と ; / # 両方のコメント記法を許容する。
+    // セクションは区別せず全キーを1つの名前空間として読む(現状これで十分なため)。
+    internal static bool ReadSettingBool(string baseDir, string key, bool dflt)
+    {
+        try
+        {
+            if (baseDir == null) return dflt;
+            string path = Path.Combine(baseDir, SettingsFileName);
+            if (!File.Exists(path)) return dflt;
+            foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
+            {
+                string line = raw.Trim().TrimStart('﻿').Trim();
+                if (line.Length == 0 ||
+                    line.StartsWith("#", StringComparison.Ordinal) ||
+                    line.StartsWith(";", StringComparison.Ordinal) ||
+                    line.StartsWith("[", StringComparison.Ordinal)) continue;
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                if (!string.Equals(line.Substring(0, eq).Trim(), key, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                string v = line.Substring(eq + 1).Trim();
+                if (v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(v, "on", StringComparison.OrdinalIgnoreCase)) return true;
+                if (v == "0" || string.Equals(v, "false", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(v, "off", StringComparison.OrdinalIgnoreCase)) return false;
+                return dflt;
+            }
+            return dflt;
+        }
+        catch { return dflt; }
+    }
+
+    // デバッグログ(1リクエスト単位の置換/変換の詳細)を出力するか。デフォルトON(従来どおり)。
+    // GUIの「設定」メニューの「デバッグログを出力する」で llm_proxy_settings.ini の
+    // debug_log キーに書かれ、ここで読む。[BOOT]/[FATAL]/[ERROR]/[EXIT] 等の重要ログは
+    // このトグルに関わらず常に出力する(切り分けに要るため)。対象は [REPLACE]/[SKIP]/
+    // [JSONFIX]/[DEDUP]/[COMPACT] などの詳細行のみ。
+    // ログ1行ごとに設定ファイルを読み直すのは無駄なので、更新時刻を見てキャッシュする。
+    static bool _debugLogCached = true;
+    static DateTime _debugLogStamp = DateTime.MinValue;
+    static readonly object DebugLogFlagLock = new object();
+    static bool DebugLogEnabled()
+    {
+        try
+        {
+            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                : Path.GetDirectoryName(_logPath);
+            if (baseDir == null) return true;
+            string path = Path.Combine(baseDir, SettingsFileName);
+            DateTime stamp = File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue;
+            lock (DebugLogFlagLock)
+            {
+                if (stamp != _debugLogStamp)
+                {
+                    _debugLogStamp = stamp;
+                    _debugLogCached = ReadSettingBool("debug_log", true);
+                }
+                return _debugLogCached;
+            }
         }
         catch { return true; }
     }
@@ -1358,14 +1444,36 @@ static class LlmProxy
                     {
                         root["prompt"] = collapsed;
                         bodyChanged = true;
-                        Log("[DEDUP] " + reqLine + " | 重複ブロックを畳んだ " +
+                        LogDebug("[DEDUP] " + reqLine + " | 重複ブロックを畳んだ " +
                             pr0.Length + "→" + collapsed.Length + "文字");
                     }
                 }
             }
 
             if (root.Contains("json_schema") || root.Contains("grammar"))
+            {
+                // ゲーム自身が既に json_schema (grammar制約) を送っているのが実運用のほぼ全件。
+                // 構造の正しさはgrammarがトークン単位で強制するため、プロンプトに人間向けの説明
+                // として埋め込まれた同一スキーマの冗長なPython dict表記(フィールド1つにつき
+                // {'title':...,'type':'string'}等の定型が付く)は、意味づけの参考(フィールド名・
+                // enum候補・入れ子構造)さえ残せば安全に圧縮できる。最も複雑なスキーマでは
+                // プロンプト全体の6〜7割をこの説明文が占めており、削るほどn_predictに対する
+                // 実効の余裕(=打ち切りされにくさ)が増える。
+                if (SchemaCompactEnabled() && root.Contains("prompt"))
+                {
+                    string pr1 = root["prompt"] as string;
+                    if (pr1 != null)
+                    {
+                        string compacted = CompactEmbeddedSchema(pr1, reqLine);
+                        if (compacted != null)
+                        {
+                            root["prompt"] = compacted;
+                            bodyChanged = true;
+                        }
+                    }
+                }
                 return bodyChanged ? Encoding.UTF8.GetBytes(JsonSerialize(root)) : body;
+            }
             string prompt = root.Contains("prompt") ? root["prompt"] as string : null;
             if (prompt == null)
                 return bodyChanged ? Encoding.UTF8.GetBytes(JsonSerialize(root)) : body;
@@ -1391,13 +1499,13 @@ static class LlmProxy
                 root["prompt"] = prompt.Substring(0, schemaStart) + schemaJson +
                                  prompt.Substring(schemaEnd);
                 root["json_schema"] = schema;
-                Log("[JSONFIX] " + reqLine + " | json_schemaを注入 (" + schemaJson.Length + "文字)");
+                LogDebug("[JSONFIX] " + reqLine + " | json_schemaを注入 (" + schemaJson.Length + "文字)");
             }
             else
             {
                 // スキーマらしき部分はあるが解析できない → 最低限の構文だけ保証
                 root["grammar"] = GenericJsonGrammar;
-                Log("[JSONFIX] " + reqLine + " | スキーマ解析失敗のため汎用JSON文法を注入");
+                LogDebug("[JSONFIX] " + reqLine + " | スキーマ解析失敗のため汎用JSON文法を注入");
             }
             return Encoding.UTF8.GetBytes(JsonSerialize(root));
         }
@@ -1423,6 +1531,140 @@ static class LlmProxy
             if (i >= 0 && (best < 0 || i < best)) best = i;
         }
         return best;
+    }
+
+    // json_schemaが既にある(=grammarで構造が強制される)場合に、プロンプト内へ埋め込まれた
+    // 同一スキーマの説明文をコンパクト表記へ置き換える。置き換え後の方が短い場合のみ適用する。
+    internal static string CompactEmbeddedSchema(string prompt, string reqLine)
+    {
+        int schemaStart = FindSchemaStart(prompt);
+        if (schemaStart < 0) return null; // スキーマ説明の埋め込みが無いリクエストには作用しない
+
+        object schema;
+        int schemaEnd = schemaStart;
+        try
+        {
+            int p = schemaStart;
+            schema = ParseLiteral(prompt, ref p);
+            schemaEnd = p;
+        }
+        catch { return null; }
+
+        OrderedDictionary schemaDict = schema as OrderedDictionary;
+        if (schemaDict == null) return null;
+
+        string compact;
+        try { compact = CompactSchemaText(schemaDict); }
+        catch { return null; } // 未知の形は安全側で無加工のまま
+
+        if (string.IsNullOrEmpty(compact)) return null;
+
+        string newPrompt = prompt.Substring(0, schemaStart) + compact.TrimEnd('\n') +
+                            prompt.Substring(schemaEnd);
+        if (newPrompt.Length >= prompt.Length) return null; // 圧縮できなければ変更しない
+
+        LogDebug("[COMPACT] " + reqLine + " | スキーマ説明を圧縮 " + prompt.Length + "→" + newPrompt.Length + "文字");
+        return newPrompt;
+    }
+
+    // JSON Schema (Pydanticが吐く形) をLLM向けの簡潔な一覧表記に落とす。
+    // 例: "Area: name, layout_description, locations:string[], atomosphere:∈{tense,normal,...}"
+    // grammarが型・必須・enum・入れ子構造をトークン単位で強制するため、ここで保持するのは
+    // 「フィールド名」「意味の手がかりになるenum値/参照先の型名」「必須/任意」だけでよい。
+    // title・type:stringのような定型句(全フィールドの大半を占める)はあえて捨てる。
+    internal static string CompactSchemaText(OrderedDictionary root)
+    {
+        var sb = new StringBuilder();
+        if (root.Contains("$defs"))
+        {
+            OrderedDictionary defs = root["$defs"] as OrderedDictionary;
+            if (defs != null)
+                foreach (System.Collections.DictionaryEntry e in defs)
+                    AppendTypeLine(sb, (string)e.Key, e.Value as OrderedDictionary);
+        }
+        string rootTitle = root.Contains("title") ? root["title"] as string : null;
+        AppendTypeLine(sb, string.IsNullOrEmpty(rootTitle) ? "Structure" : rootTitle, root);
+        return sb.Length > 0 ? sb.ToString() : null;
+    }
+
+    static void AppendTypeLine(StringBuilder sb, string typeName, OrderedDictionary typeSchema)
+    {
+        if (typeSchema == null || !typeSchema.Contains("properties")) return;
+        OrderedDictionary props = typeSchema["properties"] as OrderedDictionary;
+        if (props == null) return;
+        var required = new HashSet<string>();
+        if (typeSchema.Contains("required"))
+        {
+            System.Collections.IEnumerable reqList = typeSchema["required"] as System.Collections.IEnumerable;
+            if (reqList != null)
+                foreach (object r in reqList) required.Add(Convert.ToString(r));
+        }
+        sb.Append(typeName).Append(": ");
+        bool first = true;
+        foreach (System.Collections.DictionaryEntry e in props)
+        {
+            string fname = (string)e.Key;
+            if (!first) sb.Append(", ");
+            first = false;
+            sb.Append(fname);
+            string desc = DescribeField(e.Value as OrderedDictionary);
+            if (!string.IsNullOrEmpty(desc)) sb.Append(':').Append(desc);
+            if (!required.Contains(fname)) sb.Append('?');
+        }
+        sb.Append('\n');
+    }
+
+    // フィールド1つ分の「意味の手がかり」だけを短く書き出す。素のstring/integer/boolean/numberは
+    // 何も付けない(既定の型として扱われるため書くだけ無駄)。enum・$ref・配列・共用体だけ表記する
+    static string DescribeField(OrderedDictionary f)
+    {
+        if (f == null) return "";
+        if (f.Contains("const")) return "=\"" + Convert.ToString(f["const"]) + "\"";
+        if (f.Contains("$ref")) return RefName(f["$ref"] as string);
+        if (f.Contains("enum"))
+        {
+            System.Collections.IEnumerable vals = f["enum"] as System.Collections.IEnumerable;
+            if (vals == null) return "";
+            var parts = new List<string>();
+            foreach (object v in vals) parts.Add(Convert.ToString(v));
+            return "∈{" + string.Join(",", parts.ToArray()) + "}";
+        }
+        if (f.Contains("anyOf"))
+        {
+            System.Collections.IEnumerable options = f["anyOf"] as System.Collections.IEnumerable;
+            if (options == null) return "";
+            var parts = new List<string>();
+            bool nullable = false;
+            foreach (object opt in options)
+            {
+                OrderedDictionary od = opt as OrderedDictionary;
+                if (od == null) continue;
+                if (od.Contains("type") && (od["type"] as string) == "null") { nullable = true; continue; }
+                string d = DescribeField(od);
+                if (!string.IsNullOrEmpty(d)) parts.Add(d);
+            }
+            string joined = string.Join("|", parts.ToArray());
+            return nullable && joined.Length > 0 ? joined + "?" : joined;
+        }
+        if (f.Contains("items"))
+        {
+            string inner = DescribeField(f["items"] as OrderedDictionary);
+            if (string.IsNullOrEmpty(inner))
+            {
+                OrderedDictionary items = f["items"] as OrderedDictionary;
+                string itemType = items != null && items.Contains("type") ? items["type"] as string : null;
+                inner = itemType ?? "";
+            }
+            return inner + "[]";
+        }
+        return "";
+    }
+
+    static string RefName(string refPath)
+    {
+        if (string.IsNullOrEmpty(refPath)) return "";
+        int idx = refPath.LastIndexOf('/');
+        return idx >= 0 ? refPath.Substring(idx + 1) : refPath;
     }
 
     // JSONとPythonリテラル (dict/list/tuple/str/数値/True/False/None) の両方を
@@ -1695,6 +1937,12 @@ static class LlmProxy
 
     // 複数スレッド (接続ごと) から呼ばれるので追記は直列化する。
     // ログ出力の失敗でゲームを止めたくないので、例外はすべて握り潰す
+    // デバッグ扱いの詳細ログ。DebugLogEnabled() が true のときだけ出力する。
+    static void LogDebug(string msg)
+    {
+        if (DebugLogEnabled()) Log(msg);
+    }
+
     static void Log(string msg)
     {
         try

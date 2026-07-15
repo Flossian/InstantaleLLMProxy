@@ -52,6 +52,7 @@ class MainForm : Form
     string _root;                 // 対象のゲームルート (GUIで切替可能)
     string _rulesPath;            // llm_replacements.txt (対象フォルダ側)
     string _logPath;              // llm_proxy.log (対象フォルダ側)
+    string _settingsPath;         // llm_proxy_settings.ini (対象フォルダ側、プロキシの動作トグル用)
     string _activeLogPath;        // 実際に表示中のログ (フォールバック含む)
     readonly string _srcPath;     // llm_proxy.cs (GUI同梱のソース)
     readonly string _wrapperPath; // ビルド成果物 (GUI側に生成)
@@ -70,6 +71,10 @@ class MainForm : Form
     TabControl _tabs;
     Timer _timer;
     bool _dirty;
+    CheckBox _schemaCompactCheck; // プロンプト圧縮 (JSONスキーマ説明のコンパクト化) のON/OFF
+    ToolStripMenuItem _debugLogItem; // 設定メニュー: デバッグログを出力するか
+    bool _loadingSettings;        // 設定ロード中はCheckedChangedでの書き戻しを抑止するガード
+    int _dragTabIndex = -1;       // 置換ルールタブのドラッグ並び替え中の掴んでいるタブ添字 (-1=非ドラッグ)
 
     public MainForm()
     {
@@ -194,6 +199,24 @@ class MainForm : Form
         buttons.Controls.Add(btnRevert);
         buttons.Controls.Add(btnKill);
         buttons.Controls.Add(btnRefresh);
+
+        _schemaCompactCheck = new CheckBox();
+        _schemaCompactCheck.Text = "プロンプト圧縮 (JSONスキーマ説明を圧縮)";
+        _schemaCompactCheck.AutoSize = true;
+        _schemaCompactCheck.Checked = true;
+        _schemaCompactCheck.Margin = new Padding(14, 6, 3, 0);
+        _schemaCompactCheck.CheckedChanged += delegate
+        {
+            if (_loadingSettings) return;
+            WriteSetting("schema_compact", _schemaCompactCheck.Checked);
+        };
+        var tip = new ToolTip();
+        tip.SetToolTip(_schemaCompactCheck,
+            "ONの場合、プロンプトに埋め込まれたJSONスキーマ説明(Python dict形式)を簡潔な表記へ圧縮します。\n" +
+            "json_schema(grammar制約)自体は変更されないため、出力の構造的な正しさには影響しません。\n" +
+            "切替は即時反映されます(ゲーム再起動不要)。設定は " + SettingsFileName + " に保存されます。");
+        buttons.Controls.Add(_schemaCompactCheck);
+
         var note = new Label();
         note.Text = "※ラッパーはゲームが自動起動/終了します";
         note.AutoSize = true;
@@ -213,8 +236,39 @@ class MainForm : Form
 
         Controls.Add(_tabs);
         Controls.Add(grp);
+        // メニューは最後に追加する。Top ドックは後に追加したものほど外側 (上端) に来るため、
+        // grp より後に足すことでメニューバーが最上段に配置される。
+        Controls.Add(BuildMenu());
 
         FormClosing += OnClosingCheckDirty;
+    }
+
+    // 上部のメニューバー。現状は「設定」メニューのみ。
+    MenuStrip BuildMenu()
+    {
+        var menu = new MenuStrip();
+        menu.Dock = DockStyle.Top;
+
+        var settings = new ToolStripMenuItem("設定(&S)");
+
+        _debugLogItem = new ToolStripMenuItem("デバッグログを出力する");
+        _debugLogItem.CheckOnClick = true;
+        _debugLogItem.Checked = true;
+        _debugLogItem.ToolTipText =
+            "ONの場合、置換・変換の詳細 ([REPLACE]/[SKIP]/[JSONFIX]/[DEDUP]/[COMPACT] 等) を\n" +
+            "llm_proxy.log に記録します。OFFにすると起動・エラー等の重要ログだけになり、\n" +
+            "ログが肥大しません。切替は即時反映されます (ゲーム再起動不要)。\n" +
+            "設定は " + SettingsFileName + " に保存されます。";
+        _debugLogItem.Click += delegate
+        {
+            if (_loadingSettings) return;
+            WriteSetting("debug_log", _debugLogItem.Checked);
+        };
+        settings.DropDownItems.Add(_debugLogItem);
+
+        menu.Items.Add(settings);
+        MainMenuStrip = menu;
+        return menu;
     }
 
     TabPage BuildRulesTab()
@@ -233,7 +287,7 @@ class MainForm : Form
         bar.Controls.Add(MakeButton("タブ名変更", 100, OnRenameTab));
         bar.Controls.Add(MakeButton("タブ削除", 90, OnDeleteTab));
         var hint = new Label();
-        hint.Text = "タブ単位のチェックで一括ON/OFF。確率は同じ置換前の中から抽選。保存で即時反映。セル内改行は Shift+Enter。";
+        hint.Text = "タブ単位のチェックで一括ON/OFF。タブ見出しはドラッグで並び替え。確率は同じ置換前の中から抽選。保存で即時反映。セル内改行は Shift+Enter。";
         hint.AutoSize = true;
         hint.ForeColor = Color.Gray;
         hint.Margin = new Padding(10, 8, 3, 0);
@@ -249,6 +303,10 @@ class MainForm : Form
         {
             if (_ruleTabs.SelectedTab == _allPage) RefreshAllGrid();
         };
+        // タブ見出しのドラッグで実タブを並び替える (「すべて」タブは先頭固定で動かさない)
+        _ruleTabs.MouseDown += OnRuleTabsMouseDown;
+        _ruleTabs.MouseMove += OnRuleTabsMouseMove;
+        _ruleTabs.MouseUp += delegate { _dragTabIndex = -1; };
 
         // ---- 置換テスト ----
         var prevGrp = new GroupBox();
@@ -629,6 +687,39 @@ class MainForm : Form
         _dirty = true;
     }
 
+    // ---- タブ見出しのドラッグ並び替え ----
+    // 実タブ同士だけ入れ替える。先頭の「すべて」タブ (index 0) は掴めず、そこへも割り込ませない。
+    // 並び順はファイル保存時のタブ順にそのまま反映される (WriteRulesFile が TabPages 順に書く)
+
+    void OnRuleTabsMouseDown(object sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        int i = TabIndexAt(e.Location);
+        _dragTabIndex = (i >= 1) ? i : -1; // ALLタブ(0)や見出し外は掴まない
+    }
+
+    void OnRuleTabsMouseMove(object sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left || _dragTabIndex < 1) return;
+        int over = TabIndexAt(e.Location);
+        if (over < 1) return;            // ALLタブより前へは移動させない
+        if (over == _dragTabIndex) return;
+        var page = _ruleTabs.TabPages[_dragTabIndex];
+        _ruleTabs.TabPages.Remove(page);
+        _ruleTabs.TabPages.Insert(over, page);
+        _ruleTabs.SelectedTab = page;
+        _dragTabIndex = over;
+        _dirty = true;
+    }
+
+    // 指定座標にあるタブ見出しの添字。見出しの上でなければ -1
+    int TabIndexAt(Point pt)
+    {
+        for (int i = 0; i < _ruleTabs.TabCount; i++)
+            if (_ruleTabs.GetTabRect(i).Contains(pt)) return i;
+        return -1;
+    }
+
     // 1行入力の簡易ダイアログ。キャンセル時は null
     static string PromptText(IWin32Window owner, string title, string label, string initial)
     {
@@ -761,12 +852,99 @@ class MainForm : Form
         _root = root;
         _rulesPath = ResolveRulesPath(root);
         _logPath = Path.Combine(Path.GetDirectoryName(_rulesPath), "llm_proxy.log");
+        _settingsPath = Path.Combine(Path.GetDirectoryName(_rulesPath), SettingsFileName);
         if (_rootBox != null) _rootBox.Text = _root;
         Text = "InstantaleLlmProxy — " + _root;
         if (save) WriteConfig();
         LoadRules();
+        LoadSettingsUi();
         RefreshStatus();
         RefreshLog();
+    }
+
+    // ---------------------------------------------------------------- 設定ファイル (プロキシの動作トグル)
+    // llm_replacements.txt と同じフォルダに置くINI形式の設定ファイル。
+    // プロキシ側 (llm_proxy.cs) はリクエストのたびにこれを読んで動作を変える。
+    // 現状は schema_compact (プロンプト圧縮) の1項目のみだが、増えても対応できる形にしてある。
+    const string SettingsFileName = "llm_proxy_settings.ini";
+
+    // セクション見出し([Settings]等)は無視して、全キーを1つの名前空間として読む
+    // (現状はプロキシ側も同じ単純化をしているので合わせてある)
+    Dictionary<string, string> ReadSettingsFile()
+    {
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (_settingsPath != null && File.Exists(_settingsPath))
+            {
+                foreach (string raw in File.ReadAllLines(_settingsPath, Encoding.UTF8))
+                {
+                    string line = raw.Trim().TrimStart('﻿').Trim();
+                    if (line.Length == 0 ||
+                        line.StartsWith("#", StringComparison.Ordinal) ||
+                        line.StartsWith(";", StringComparison.Ordinal) ||
+                        line.StartsWith("[", StringComparison.Ordinal)) continue;
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    dict[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+                }
+            }
+        }
+        catch { }
+        return dict;
+    }
+
+    bool ReadSettingBoolUi(string key, bool dflt)
+    {
+        string v;
+        if (!ReadSettingsFile().TryGetValue(key, out v)) return dflt;
+        v = v.Trim();
+        if (v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(v, "on", StringComparison.OrdinalIgnoreCase)) return true;
+        if (v == "0" || string.Equals(v, "false", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(v, "off", StringComparison.OrdinalIgnoreCase)) return false;
+        return dflt;
+    }
+
+    // 既存のキーは保持したまま(将来キーが増えても手書き分を壊さない)、指定キーだけ更新して書き戻す。
+    // 保存は即時に行い、次のLLMリクエストからプロキシ側に自動反映される (ゲーム再起動不要)。
+    void WriteSetting(string key, bool value)
+    {
+        try
+        {
+            var dict = ReadSettingsFile();
+            dict[key] = value ? "1" : "0";
+            var sb = new StringBuilder();
+            sb.AppendLine("; ============================================================");
+            sb.AppendLine("; InstantaleLlmProxy 設定ファイル (GUIの操作で自動生成・更新)");
+            sb.AppendLine("; key=value 形式 (1/0)。手動編集も可。保存すると次のLLMリクエストから反映");
+            sb.AppendLine("; ・schema_compact: プロンプトに埋め込まれたJSONスキーマ説明を圧縮するか");
+            sb.AppendLine("; ・debug_log: 置換/変換の詳細ログ([REPLACE]等)を llm_proxy.log に出すか");
+            sb.AppendLine("; ============================================================");
+            sb.AppendLine("[Settings]");
+            foreach (var kv in dict) sb.AppendLine(kv.Key + "=" + kv.Value);
+            Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath));
+            File.WriteAllText(_settingsPath, sb.ToString(), new UTF8Encoding(true));
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "設定の保存に失敗:\n" + ex.Message +
+                "\n\n対象が Program Files 配下などの場合は、GUIを管理者として実行してください。",
+                "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    // 対象フォルダ切替時などに、設定ファイルの内容をチェックボックスへ反映する。
+    // _loadingSettings で囲むことで、反映中に CheckedChanged が誤って書き戻すのを防ぐ
+    void LoadSettingsUi()
+    {
+        _loadingSettings = true;
+        try
+        {
+            _schemaCompactCheck.Checked = ReadSettingBoolUi("schema_compact", true);
+            if (_debugLogItem != null) _debugLogItem.Checked = ReadSettingBoolUi("debug_log", true);
+        }
+        finally { _loadingSettings = false; }
     }
 
     // 前回終了時のウィンドウ位置・サイズを設定ファイルの2行目から復元する。
