@@ -29,6 +29,19 @@
 //   Pythonクライアントが日本語を \uXXXX エスケープして送る場合にも対応するため、
 //   各ルールのエスケープ版も自動生成して照合する。
 //
+// 本物のシングルトン化 (多重ロード抑止):
+//   ゲームは1回の操作でラッパー(llama-server.exe)を複数同時に起動し、しかも
+//   古いラッパーを確実には終了させない (プロキシ無しでも発生するゲーム側の挙動)。
+//   各ラッパーが素直に本物を起動すると、同じ26Bモデルが何本もGPUに載って
+//   VRAMが枯渇し、ロードが激遅になる (→再生成で更に増える悪循環)。
+//   そこで、同一起動引数(=同一モデル・同一設定)の本物は1本だけに集約する:
+//     ・最初に起動したラッパーが本物を起動して「所有者」になる
+//     ・以降のラッパーは本物を起動せず、所有者の本物ポートへ中継するだけ(フォロワー)
+//   調停はMODフォルダのレジストリファイル + 名前付きMutexで行う。所有者が消えて
+//   本物も道連れ(Jobオブジェクト)になった場合は、フォロワーが検知して共有先を
+//   取り直す (誰かが昇格していればそれを、居なければ自分が昇格して本物を再起動)。
+//   引数が異なる(別モデル等)場合は別グループとして各1本が起動する。
+//
 // ログ: ルールファイルと同じフォルダの llm_proxy.log
 //
 // ビルド: src\llm_proxy_apply.bat または管理GUI (InstantaleLlmProxy.exe) が行う
@@ -44,6 +57,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 
@@ -75,9 +89,22 @@ static class LlmProxy
     static string _exeDir;
     static string _rulesPath;
     static DateTime _rulesStamp = DateTime.MinValue;
-    static int _upstreamPort;
+    static volatile int _upstreamPort;
     static Process _child;
     static IntPtr _job = IntPtr.Zero;
+
+    // 本物のシングルトン化に使う状態。
+    // _isOwner=trueなら自分が本物(_child)を起動・所有している。falseなら他ラッパーの
+    // 本物(_ownerPid)へ中継するだけのフォロワー。所有者消失時はフォロワーが昇格しうる。
+    static string[] _origArgs = new string[0];
+    static string _realExe;
+    static int _ctxSize;                    // --ctx-size (診断で打ち切り判定に併記)
+    static string _sigHash;                 // 起動引数から作る集約キー(モデル・設定が同じなら同一)
+    static volatile bool _isOwner;
+    static volatile int _ownerPid;          // 共有している本物を所有するラッパーのpid
+    static volatile bool _watchStarted;     // WatchChildスレッドを二重起動しないためのフラグ
+    static readonly object AcquireLock = new object();
+    static readonly string SelfProcName = Process.GetCurrentProcess().ProcessName;
 
     // 起動直後の唯一の関心事はログの出力先を確定させること。
     // ここから先の失敗はすべてログに残したいので、Runに入る前に _logPath を決める。
@@ -135,56 +162,28 @@ static class LlmProxy
     {
         _exeDir = exeDir;
         _rulesPath = rulesPath;
+        _origArgs = args;
         ReloadRulesIfChanged();
         Log("[BOOT] 起動 args: " + string.Join(" ", args));
         Log("[BOOT] ルール: " + (_rulesPath ?? "(なし)") + " " + Rules.Count + "パターン(エスケープ版含む)");
 
-        _upstreamPort = FindFreePort();
+        // ゲームが繋ぎに来る待ち受け先。これはラッパー固有(引数の--port)で、集約とは無関係
+        int listenPort;
+        string listenHost;
+        ParseListenEndpoint(args, out listenHost, out listenPort);
+        _ctxSize = ParseIntArg(args, "--ctx-size", 0);
 
-        // --port / --host を解析し、子プロセス用引数ではポートを内部ポートに差し替える
-        int listenPort = 8080;          // llama-server のデフォルト
-        string listenHost = "127.0.0.1";
-        bool portFound = false;
-        var childArgs = new List<string>(args);
-        for (int i = 0; i < childArgs.Count; i++)
+        _realExe = Path.Combine(exeDir, RealExeName);
+        if (!File.Exists(_realExe))
         {
-            string a = childArgs[i];
-            if (a == "--port" && i + 1 < childArgs.Count)
-            {
-                int.TryParse(childArgs[i + 1], out listenPort);
-                childArgs[i + 1] = _upstreamPort.ToString();
-                portFound = true;
-            }
-            else if (a.StartsWith("--port=", StringComparison.Ordinal))
-            {
-                int.TryParse(a.Substring(7), out listenPort);
-                childArgs[i] = "--port=" + _upstreamPort;
-                portFound = true;
-            }
-            else if (a == "--host" && i + 1 < childArgs.Count) listenHost = childArgs[i + 1];
-            else if (a.StartsWith("--host=", StringComparison.Ordinal)) listenHost = a.Substring(7);
-        }
-        if (!portFound)
-        {
-            // ポート未指定ならデフォルト8080で待ち受け、本物は内部ポートへ
-            childArgs.Add("--port");
-            childArgs.Add(_upstreamPort.ToString());
-        }
-
-        string realExe = Path.Combine(exeDir, RealExeName);
-        if (!File.Exists(realExe))
-        {
-            Log("[FATAL] 本物のサーバが見つかりません: " + realExe);
+            Log("[FATAL] 本物のサーバが見つかりません: " + _realExe);
             return 1;
         }
 
-        _child = StartChild(realExe, childArgs);
-        SetupJobObject(_child); // ラッパーが死んだら本物も道連れにする
-
-        // 子プロセス監視: 本物が終了したらラッパーも同じコードで終了
-        var watchdog = new Thread(WatchChild);
-        watchdog.IsBackground = true;
-        watchdog.Start();
+        // 同一引数の本物を1本に集約する。所有者になれば本物を起動し、既存が生きていれば
+        // それを共有する。_upstreamPort / _isOwner / _child はここで確定する
+        _sigHash = ShortHash(BuildSignature(args));
+        AcquireUpstream();
 
         IPAddress addr;
         if (listenHost == "0.0.0.0") addr = IPAddress.Any;
@@ -201,6 +200,250 @@ static class LlmProxy
             t.IsBackground = true;
             t.Start();
         }
+    }
+
+    // ---------------------------------------------------------------- 本物の集約(シングルトン化)
+
+    // ゲームが繋ぎに来る待ち受けホスト/ポートを引数から取り出す(未指定はllama-serverと同じ8080)
+    static void ParseListenEndpoint(string[] args, out string host, out int port)
+    {
+        host = "127.0.0.1";
+        port = 8080;
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            if (a == "--port" && i + 1 < args.Length) int.TryParse(args[i + 1], out port);
+            else if (a.StartsWith("--port=", StringComparison.Ordinal)) int.TryParse(a.Substring(7), out port);
+            else if (a == "--host" && i + 1 < args.Length) host = args[i + 1];
+            else if (a.StartsWith("--host=", StringComparison.Ordinal)) host = a.Substring(7);
+        }
+    }
+
+    // 共有する本物のスロットを1つに固定する (--parallel 1)。既存の指定は上書きし、
+    // 無ければ追加する。これで並行リクエストは直列化され、各々フルのコンテキストを使える。
+    static void ForceParallelOne(List<string> args)
+    {
+        for (int i = 0; i < args.Count; i++)
+        {
+            if ((args[i] == "--parallel" || args[i] == "-np") && i + 1 < args.Count)
+            {
+                args[i + 1] = "1";
+                return;
+            }
+            if (args[i].StartsWith("--parallel=", StringComparison.Ordinal))
+            {
+                args[i] = "--parallel=1";
+                return;
+            }
+        }
+        args.Add("--parallel");
+        args.Add("1");
+    }
+
+    // 「--name 値」または「--name=値」形式の整数引数を取り出す。無ければ dflt
+    static int ParseIntArg(string[] args, string name, int dflt)
+    {
+        string eq = name + "=";
+        for (int i = 0; i < args.Length; i++)
+        {
+            int v;
+            if (args[i] == name && i + 1 < args.Length)
+            {
+                if (int.TryParse(args[i + 1], out v)) return v;
+            }
+            else if (args[i].StartsWith(eq, StringComparison.Ordinal))
+            {
+                if (int.TryParse(args[i].Substring(eq.Length), out v)) return v;
+            }
+        }
+        return dflt;
+    }
+
+    // 本物へ渡す引数。--port だけを内部の空きポートに差し替える(未指定なら追加する)
+    static List<string> BuildChildArgs(string[] args, int upstreamPort)
+    {
+        var childArgs = new List<string>(args);
+        bool portFound = false;
+        for (int i = 0; i < childArgs.Count; i++)
+        {
+            string a = childArgs[i];
+            if (a == "--port" && i + 1 < childArgs.Count)
+            {
+                childArgs[i + 1] = upstreamPort.ToString();
+                portFound = true;
+            }
+            else if (a.StartsWith("--port=", StringComparison.Ordinal))
+            {
+                childArgs[i] = "--port=" + upstreamPort;
+                portFound = true;
+            }
+        }
+        if (!portFound)
+        {
+            childArgs.Add("--port");
+            childArgs.Add(upstreamPort.ToString());
+        }
+        return childArgs;
+    }
+
+    // 集約キー。待ち受け先(--port/--host)以外の引数が全て同じなら同一モデル・同一設定と見なす。
+    // これが一致するラッパー同士で本物を1本に共有する
+    static string BuildSignature(string[] args)
+    {
+        var sb = new StringBuilder();
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            if (a == "--port" || a == "--host") { i++; continue; } // 値も飛ばす
+            if (a.StartsWith("--port=", StringComparison.Ordinal) ||
+                a.StartsWith("--host=", StringComparison.Ordinal)) continue;
+            if (sb.Length > 0) sb.Append(' ');
+            sb.Append(a);
+        }
+        return sb.ToString();
+    }
+
+    static string ShortHash(string s)
+    {
+        using (var md5 = MD5.Create())
+        {
+            byte[] h = md5.ComputeHash(Encoding.UTF8.GetBytes(s ?? ""));
+            var sb = new StringBuilder();
+            for (int i = 0; i < 6; i++) sb.Append(h[i].ToString("x2"));
+            return sb.ToString();
+        }
+    }
+
+    // レジストリ/Mutex はMODフォルダ(ルールファイルと同じ場所)基準。同一集約キーの
+    // ラッパー同士が同じファイル/Mutexを見ることで、プロセスをまたいで調停できる
+    static string RegistryPath()
+    {
+        try
+        {
+            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                : Path.GetDirectoryName(_logPath);
+            return baseDir == null ? null : Path.Combine(baseDir, "llm_proxy_upstream_" + _sigHash + ".txt");
+        }
+        catch { return null; }
+    }
+
+    static bool ReadRegistry(out int pid, out int port)
+    {
+        pid = 0; port = 0;
+        try
+        {
+            string p = RegistryPath();
+            if (p == null || !File.Exists(p)) return false;
+            string[] parts = File.ReadAllText(p).Trim().Split(',');
+            if (parts.Length < 2) return false;
+            return int.TryParse(parts[0].Trim(), out pid) && int.TryParse(parts[1].Trim(), out port);
+        }
+        catch { return false; }
+    }
+
+    static void WriteRegistry(int pid, int port)
+    {
+        try
+        {
+            string p = RegistryPath();
+            if (p != null) File.WriteAllText(p, pid + "," + port);
+        }
+        catch { }
+    }
+
+    // pid のプロセスが「生きているラッパー」か。PID再利用で無関係なプロセスを所有者と
+    // 誤認しないよう、自分と同じ実行ファイル名(llama-server)であることまで確かめる
+    static bool IsWrapperAlive(int pid)
+    {
+        if (pid <= 0) return false;
+        try
+        {
+            var p = Process.GetProcessById(pid);
+            if (p.HasExited) return false;
+            return string.Equals(p.ProcessName, SelfProcName, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    // 本物の共有先を確定する。既に生きた所有者が居ればフォロワーとしてそのポートを使い、
+    // 居なければ自分が本物を起動して所有者になる。所有者消失後の再取得(昇格)にも使う。
+    // 判断はプロセスをまたぐ名前付きMutexで直列化し、二重起動を防ぐ
+    static void AcquireUpstream()
+    {
+        lock (AcquireLock)
+        {
+            if (_isOwner) return; // 既に自分が所有しているなら何もしない
+
+            // シングルトン無効時は集約せず、各ラッパーが自分専用の本物を起動する(従来動作)。
+            // ゲームが並行生成する場合、共有だと1本の16384コンテキストを分割してしまい
+            // context-exceeded になるため、切り分け用のスイッチ (llm_proxy_singleton_off.txt)。
+            if (!SingletonEnabled())
+            {
+                BecomeOwner(Process.GetCurrentProcess().Id);
+                Log("[BOOT] シングルトン無効: 専用の本物を起動");
+                return;
+            }
+
+            int myPid = Process.GetCurrentProcess().Id;
+            var mtx = new Mutex(false, "Local\\InstantaleLlmProxy_" + _sigHash);
+            bool haveMutex = false;
+            try
+            {
+                try { haveMutex = mtx.WaitOne(TimeSpan.FromSeconds(30)); }
+                catch (AbandonedMutexException) { haveMutex = true; } // 前所有者の異常終了時も取得する
+
+                int pid, port;
+                if (ReadRegistry(out pid, out port) && pid != myPid && IsWrapperAlive(pid))
+                {
+                    // 生きた所有者が居る → 本物は起動せず共有する(フォロワー)
+                    _ownerPid = pid;
+                    _upstreamPort = port;
+                    _isOwner = false;
+                    Log("[BOOT] 既存の本物を共有 owner_pid=" + pid + " -> upstream 127.0.0.1:" + port);
+                    return;
+                }
+
+                BecomeOwner(myPid); // 所有者になる: 本物を起動してレジストリに登録する
+            }
+            finally
+            {
+                if (haveMutex) { try { mtx.ReleaseMutex(); } catch { } }
+                mtx.Close();
+            }
+        }
+    }
+
+    // 自分が本物を起動して所有者になる (AcquireLock 保持前提)
+    static void BecomeOwner(int myPid)
+    {
+        int up = FindFreePort();
+        var childArgs = BuildChildArgs(_origArgs, up);
+        // シングルトン有効時は1本の本物を複数ラッパーで共有する。本物が複数スロット
+        // (--parallel>1) だと 16384 のコンテキストをスロットで分割し、並行生成で
+        // context-exceeded(HTTP500)になる。--parallel 1 に固定して並行リクエストを
+        // 直列化し、各リクエストにフルのコンテキストを与える。
+        if (SingletonEnabled()) ForceParallelOne(childArgs);
+        _child = StartChild(_realExe, childArgs);
+        SetupJobObject(_child); // 所有ラッパーが死んだら本物も道連れにする
+        _upstreamPort = up;
+        _ownerPid = myPid;
+        _isOwner = true;
+        WriteRegistry(myPid, up);
+        if (!_watchStarted)
+        {
+            _watchStarted = true;
+            // 子プロセス監視: 本物が終了したらラッパーも同じコードで終了
+            var watchdog = new Thread(WatchChild) { IsBackground = true };
+            watchdog.Start();
+        }
+    }
+
+    // フォロワーが共有先の所有者消失を検知したときの復旧。所有者が生きているなら
+    // (ロード中の可能性があるので)何もせず待つ。消えていれば共有先を取り直す
+    static void RecoverUpstream()
+    {
+        if (_isOwner) return;
+        AcquireUpstream();
     }
 
     // ---------------------------------------------------------------- 子プロセス
@@ -284,7 +527,8 @@ static class LlmProxy
         }
     }
 
-    // 本物のサーバへ接続する。モデルロード中でポートが開くまで再試行する
+    // 本物のサーバへ接続する。モデルロード中でポートが開くまで再試行する。
+    // フォロワーの場合、共有先の所有者が消えていたら共有先を取り直して(昇格を含む)続行する
     static TcpClient ConnectUpstream()
     {
         DateTime deadline = DateTime.UtcNow.AddMinutes(10);
@@ -292,7 +536,23 @@ static class LlmProxy
         {
             try { return new TcpClient("127.0.0.1", _upstreamPort); }
             catch (SocketException) { }
-            try { if (_child.HasExited) return null; } catch { return null; }
+
+            if (_isOwner)
+            {
+                // 自分の本物が終了したなら中継しても無駄。接続を諦める
+                try { if (_child.HasExited) return null; } catch { return null; }
+            }
+            else if (!IsWrapperAlive(_ownerPid))
+            {
+                // 共有していた所有者が消えた=本物も道連れ。共有先を取り直す
+                // (誰かが昇格していればそれを、居なければ自分が昇格する)
+                RecoverUpstream();
+                if (_isOwner)
+                {
+                    try { if (_child.HasExited) return null; } catch { return null; }
+                }
+            }
+            // フォロワーで所有者が生きている場合はロード完了待ちとして再試行する
             Thread.Sleep(250);
         }
         Log("[ERROR] upstream接続タイムアウト port=" + _upstreamPort);
@@ -399,7 +659,10 @@ static class LlmProxy
     }
 
     // 無加工の一方向中継。レスポンス(本物→ゲーム)はこれで流す。
-    // トークンが生成されるそばから届くよう、溜めずに読めた分だけ即書き出す
+    // トークンが生成されるそばから届くよう、溜めずに読めた分だけ即書き出す。
+    // 診断モード時のみ、SSEレスポンスの最終イベントを RespStats で覗き見して統計を
+    // ログに記録する(中身は一切変更しない)。実フォーマットが版によって違う可能性が
+    // あるため、生の最終イベントも別ファイルへダンプして後から突き合わせられるようにする。
     static void PipeRaw(TcpClient src, TcpClient dst)
     {
         try
@@ -407,7 +670,13 @@ static class LlmProxy
             NetworkStream a = src.GetStream(), b = dst.GetStream();
             var buf = new byte[65536];
             int n;
-            while ((n = a.Read(buf, 0, buf.Length)) > 0) b.Write(buf, 0, n);
+            RespStats stats = DiagEnabled() ? new RespStats(_ctxSize) : null;
+            while ((n = a.Read(buf, 0, buf.Length)) > 0)
+            {
+                b.Write(buf, 0, n);
+                if (stats != null) stats.Feed(buf, n);
+            }
+            if (stats != null) stats.Flush();
         }
         catch { }
         finally
@@ -415,6 +684,164 @@ static class LlmProxy
             // 片方が閉じたら両方閉じて、反対方向のスレッドも解放する
             SafeClose(src);
             SafeClose(dst);
+        }
+    }
+
+    // s の中の key ("...":) 直後の整数を取り出す。無い/整数でないなら -1
+    static long ExtractLong(string s, string key)
+    {
+        int i = s.IndexOf(key, StringComparison.Ordinal);
+        if (i < 0) return -1;
+        i += key.Length;
+        while (i < s.Length && s[i] == ' ') i++;
+        int start = i;
+        if (i < s.Length && (s[i] == '-' || s[i] == '+')) i++;
+        while (i < s.Length && s[i] >= '0' && s[i] <= '9') i++;
+        if (i == start) return -1;
+        long v;
+        return long.TryParse(s.Substring(start, i - start),
+            NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : -1;
+    }
+
+    // レスポンス(SSEストリーム)の最終イベントを集めて統計をログする診断用。
+    // 「"stop":true」を含むイベントが最終イベント(トークン途中は "stop":false)。
+    // 版によって打ち切りフィールド名が違う(stopped_limit / stop_type:"limit")ため、
+    // 最終イベントを丸ごと集めてから名前非依存で抽出する。さらに生の最終イベント
+    // (捕捉できなければレスポンス末尾)を llm_proxy_resp_dump.log に出し、実フォーマットを残す。
+    internal sealed class RespStats
+    {
+        readonly int _ctx;
+        bool _inFinal;
+        bool _emitted;
+        readonly StringBuilder _final = new StringBuilder();
+        byte[] _carry;              // "stop":true が境界で割れても拾うための小さな繰り越し
+        byte[] _tail;               // 常時保持する末尾(マーカー不検出時の生ダンプ用)
+        const int TailKeep = 2048;
+        const int Cap = 262144;     // 最終イベントが prompt/settings 込みで肥大しても上限で確定
+        static readonly Encoding Latin1 = Encoding.GetEncoding(28591);
+        static readonly object DumpLock = new object();
+
+        public RespStats(int ctx) { _ctx = ctx; }
+
+        public void Feed(byte[] buf, int n)
+        {
+            UpdateTail(buf, n);
+            if (!_inFinal)
+            {
+                int carryLen = _carry == null ? 0 : _carry.Length;
+                string s;
+                if (carryLen > 0)
+                {
+                    var combined = new byte[carryLen + n];
+                    Buffer.BlockCopy(_carry, 0, combined, 0, carryLen);
+                    Buffer.BlockCopy(buf, 0, combined, carryLen, n);
+                    s = Latin1.GetString(combined);
+                }
+                else s = Latin1.GetString(buf, 0, n);
+
+                int idx = s.IndexOf("\"stop\":true", StringComparison.Ordinal);
+                if (idx < 0)
+                {
+                    int keep = Math.Min(16, s.Length);
+                    _carry = Latin1.GetBytes(s.Substring(s.Length - keep));
+                    return;
+                }
+                _inFinal = true;
+                _carry = null;
+                _final.Append(s, idx, s.Length - idx);
+            }
+            else
+            {
+                _final.Append(Latin1.GetString(buf, 0, n));
+            }
+
+            int term = IndexOfTerminator(_final);
+            if (term >= 0 || _final.Length > Cap)
+            {
+                Emit(term >= 0 ? _final.ToString(0, term) : _final.ToString());
+                _inFinal = false;
+                _final.Length = 0;
+            }
+        }
+
+        // レスポンス終了時。最終イベントを取りこぼしていたら末尾を生ダンプして実態を残す。
+        public void Flush()
+        {
+            if (_inFinal && _final.Length > 0)
+            {
+                int term = IndexOfTerminator(_final);
+                Emit(term >= 0 ? _final.ToString(0, term) : _final.ToString());
+            }
+            else if (!_emitted && _tail != null)
+            {
+                Dump("[stop:true 未検出のためレスポンス末尾をダンプ]\r\n" + Latin1.GetString(_tail));
+            }
+        }
+
+        void UpdateTail(byte[] buf, int n)
+        {
+            int prev = _tail == null ? 0 : _tail.Length;
+            int keep = Math.Min(TailKeep, prev + n);
+            var t = new byte[keep];
+            int fromBuf = Math.Min(keep, n);
+            Buffer.BlockCopy(buf, n - fromBuf, t, keep - fromBuf, fromBuf);
+            int rem = keep - fromBuf;
+            if (rem > 0 && _tail != null) Buffer.BlockCopy(_tail, prev - rem, t, 0, rem);
+            _tail = t;
+        }
+
+        // 圧縮JSON中に生の改行は無い(文字列内は \n にエスケープ済み)ので、
+        // 生の \n\n または \r\n\r\n はSSEイベント境界を意味する
+        static int IndexOfTerminator(StringBuilder sb)
+        {
+            for (int i = 1; i < sb.Length; i++)
+            {
+                if (sb[i] == '\n' && sb[i - 1] == '\n') return i - 1;
+                if (i >= 3 && sb[i] == '\n' && sb[i - 1] == '\r' && sb[i - 2] == '\n' && sb[i - 3] == '\r') return i - 3;
+            }
+            return -1;
+        }
+
+        void Emit(string ev)
+        {
+            _emitted = true;
+            long te = ExtractLong(ev, "\"tokens_evaluated\":");
+            if (te < 0) te = ExtractLong(ev, "\"prompt_n\":");
+            long tp = ExtractLong(ev, "\"tokens_predicted\":");
+            if (tp < 0) tp = ExtractLong(ev, "\"predicted_n\":");
+            bool limit = ev.IndexOf("\"stopped_limit\":true", StringComparison.Ordinal) >= 0
+                      || ev.IndexOf("\"stop_type\":\"limit\"", StringComparison.Ordinal) >= 0;
+            bool trunc = ev.IndexOf("\"truncated\":true", StringComparison.Ordinal) >= 0;
+            Log("[DIAG] [RESP] tokens_evaluated=" + te + " tokens_predicted=" + tp +
+                " truncated=" + trunc + " limit=" + limit + " ctx=" + _ctx);
+            Dump(ev);
+        }
+
+        // 生の最終イベント(Latin-1でデコード。ASCIIのフィールド名/数値は読める。日本語本文は化ける)を追記
+        void Dump(string ev)
+        {
+            try
+            {
+                string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                    : Path.GetDirectoryName(_logPath);
+                if (baseDir == null) return;
+                string path = Path.Combine(baseDir, "llm_proxy_resp_dump.log");
+                string dump = ev;
+                if (dump.Length > 8000)
+                    dump = dump.Substring(0, 2500) + "\r\n…(" + (ev.Length - 6500) + " 文字省略)…\r\n" +
+                           dump.Substring(dump.Length - 4000);
+                var sb = new StringBuilder();
+                sb.Append("==== ").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"))
+                  .Append(" final-event (").Append(ev.Length).Append(" 文字) ====\r\n")
+                  .Append(dump).Append("\r\n\r\n");
+                lock (DumpLock)
+                {
+                    File.AppendAllText(path, sb.ToString(), new UTF8Encoding(false));
+                    var fi = new FileInfo(path);
+                    if (fi.Exists && fi.Length > 20 * 1024 * 1024) fi.Delete();
+                }
+            }
+            catch { }
         }
     }
 
@@ -661,6 +1088,8 @@ static class LlmProxy
     // ・無効化したい場合はMODフォルダに llm_proxy_jsonfix_off.txt を置く
 
     const string JsonFixOffFileName = "llm_proxy_jsonfix_off.txt";
+    const string DedupOffFileName = "llm_proxy_dedup_off.txt";
+    const string SingletonOffFileName = "llm_proxy_singleton_off.txt";
     const string DiagOnFileName = "llm_proxy_diag_on.txt";
 
     static bool JsonFixEnabled()
@@ -671,6 +1100,33 @@ static class LlmProxy
                                                 : Path.GetDirectoryName(_logPath);
             if (baseDir == null) return true;
             return !File.Exists(Path.Combine(baseDir, JsonFixOffFileName));
+        }
+        catch { return true; }
+    }
+
+    // プロンプト重複ブロックの畳み込みはデフォルトON。無効化はMODフォルダに llm_proxy_dedup_off.txt。
+    static bool DedupEnabled()
+    {
+        try
+        {
+            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                : Path.GetDirectoryName(_logPath);
+            if (baseDir == null) return true;
+            return !File.Exists(Path.Combine(baseDir, DedupOffFileName));
+        }
+        catch { return true; }
+    }
+
+    // 本物のシングルトン化(集約)はデフォルトON。無効化はMODフォルダに llm_proxy_singleton_off.txt。
+    // 無効時は各ラッパーが専用の本物を起動する(コンテキスト分割による context-exceeded の切り分け用)。
+    static bool SingletonEnabled()
+    {
+        try
+        {
+            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                : Path.GetDirectoryName(_logPath);
+            if (baseDir == null) return true;
+            return !File.Exists(Path.Combine(baseDir, SingletonOffFileName));
         }
         catch { return true; }
     }
@@ -734,6 +1190,107 @@ static class LlmProxy
         }
     }
 
+    static readonly object PromptDumpLock = new object();
+
+    // 診断用: 受信プロンプト全文を別ファイルに追記する。再生成のたびに増える分を
+    // 前後のダンプで突き合わせ、何が重複しているかを目視で確定するため。
+    static void DumpPrompt(string reqLine, long nPredict, string prompt)
+    {
+        try
+        {
+            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                : Path.GetDirectoryName(_logPath);
+            if (baseDir == null) return;
+            string path = Path.Combine(baseDir, "llm_proxy_prompt_dump.log");
+            var sb = new StringBuilder();
+            sb.Append("==== ").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"))
+              .Append(" ").Append(reqLine)
+              .Append(" | n_predict=").Append(nPredict)
+              .Append(" | prompt文字数=").Append(prompt.Length)
+              .Append(" ====\r\n").Append(prompt).Append("\r\n\r\n");
+            lock (PromptDumpLock)
+            {
+                File.AppendAllText(path, sb.ToString(), new UTF8Encoding(false));
+                var fi = new FileInfo(path);
+                if (fi.Exists && fi.Length > 20 * 1024 * 1024) fi.Delete(); // 肥大化防止
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("[DIAG] プロンプトダンプ失敗: " + ex.Message);
+        }
+    }
+
+    // プロンプト内に重複した大きなブロック(再生成のたびに固定量ずつ増える原因の疑い)を
+    // 検出し、長さ・位置・先頭断片を返す。無ければ null。
+    // 9等分の各点に置いた128文字プローブが2度目に出現するかを見て、当たれば前後へ伸ばして
+    // 重複区間の全長を測る(重複ブロックがこの粒度なら少なくとも1点が内部に当たる)。
+    internal static string DetectDuplicateBlock(string p)
+    {
+        if (p == null || p.Length < 512) return null;
+        const int Probe = 128;
+        int bestLen = 0, bestA = 0, bestB = 0;
+        for (int k = 1; k <= 8; k++)
+        {
+            int off = (int)((long)p.Length * k / 9);
+            if (off + Probe >= p.Length) continue;
+            string probe = p.Substring(off, Probe);
+            int second = p.IndexOf(probe, off + Probe, StringComparison.Ordinal);
+            if (second < 0) continue;
+            int a = off, b = second;
+            int fwd = Probe;
+            while (a + fwd < p.Length && b + fwd < p.Length && p[a + fwd] == p[b + fwd]) fwd++;
+            int bwd = 0;
+            // 2区間が重ならない範囲で後方へ伸ばす (b側の開始が a側の終端を越えないように)
+            while (a - bwd - 1 >= 0 && b - bwd - 1 > a + fwd - 1 && p[a - bwd - 1] == p[b - bwd - 1]) bwd++;
+            int len = fwd + bwd;
+            if (len > bestLen) { bestLen = len; bestA = a - bwd; bestB = b - bwd; }
+        }
+        if (bestLen < 200) return null; // 短い偶然の一致は無視
+        string head = p.Substring(bestA, Math.Min(60, bestLen)).Replace("\r", "").Replace("\n", "\\n");
+        return "len=" + bestLen + " pos1=" + bestA + " pos2=" + bestB + " 先頭=\"" + head + "…\"";
+    }
+
+    // プロンプト内で大きなブロックが直後に完全一致で繰り返される(tandem repeat)場合、1個に畳む。
+    // 完全一致の隣接コピーだけを畳むので意味は変わらない。畳めなければ元の文字列をそのまま返す。
+    // 9等分の各点に128文字プローブを置き、2度目の出現との距離を周期候補として前後に伸ばし、
+    // 周期領域が2コピー分以上あれば畳み込む。偶然の一致や正当な短い定型を守るため周期は1000文字以上に限定。
+    internal static string CollapseRepeatedBlocks(string p)
+    {
+        if (p == null || p.Length < 2048) return p;
+        const int Probe = 128;
+        const int MinPeriod = 1000;
+        for (int guard = 0; guard < 8; guard++)
+        {
+            int foundPeriod = 0, foundLo = 0;
+            for (int k = 1; k <= 8 && foundPeriod == 0; k++)
+            {
+                int off = (int)((long)p.Length * k / 9);
+                if (off + Probe >= p.Length) continue;
+                string probe = p.Substring(off, Probe);
+                int second = p.IndexOf(probe, off + Probe, StringComparison.Ordinal);
+                if (second < 0) continue;
+                int period = second - off;
+                if (period < MinPeriod) continue;
+                // この周期で隣接コピーが成立するか、前後に伸ばして周期領域を確定する
+                int lo = off;
+                while (lo - 1 >= 0 && p[lo - 1] == p[lo - 1 + period]) lo--;
+                int hi = off;
+                while (hi + period < p.Length && p[hi] == p[hi + period]) hi++;
+                int spanLen = (hi - lo) + period; // 周期領域の全長
+                if (spanLen >= 2 * period) { foundPeriod = period; foundLo = lo; }
+            }
+            if (foundPeriod == 0) break;
+            // foundLo から foundPeriod ごとに同一コピーが続く分を1個だけ残して除去する
+            int posEnd = foundLo;
+            while (posEnd + foundPeriod <= p.Length &&
+                   string.CompareOrdinal(p, posEnd, p, foundLo, foundPeriod) == 0)
+                posEnd += foundPeriod;
+            p = p.Substring(0, foundLo + foundPeriod) + p.Substring(posEnd);
+        }
+        return p;
+    }
+
     // JSONFIXの対象は生成リクエストだけ。/apply-template などの前処理には触らない。
     // リクエスト行「POST /completion HTTP/1.1」からパス部分だけを取り出して判定する
     static bool IsCompletionRequest(string reqLine)
@@ -776,14 +1333,46 @@ static class LlmProxy
                     " | prompt文字数=" + (promptDiag != null ? promptDiag.Length : -1));
                 if (root.Contains("json_schema"))
                     DumpSchema(reqLine, root["json_schema"], nPredictDiag, promptDiag);
+                if (promptDiag != null)
+                {
+                    // 再生成のたびにプロンプトが固定量ずつ増える(=同じブロックの重複追加)疑いを
+                    // 実データで確定させる。重複ブロックを検出したら長さ・位置を1行で報告し、
+                    // 全文も別ファイルにダンプして重複部分を目視できるようにする。
+                    string dup = DetectDuplicateBlock(promptDiag);
+                    if (dup != null) Log("[DIAG] [DUP] " + reqLine + " | 重複ブロック検出 " + dup);
+                    DumpPrompt(reqLine, nPredictDiag, promptDiag);
+                }
             }
 
-            if (root.Contains("json_schema") || root.Contains("grammar")) return body;
+            // プロンプト内で大きなブロックが直後に完全一致で繰り返される(tandem repeat)場合、1個に畳む。
+            // ゲームがスキーマ系システムメッセージを再生成のたびに重複追加し、コンテキスト枯渇→500エラーを
+            // 起こす不具合の対策。json_schemaの有無に関わらず適用する。無効化は MODフォルダに llm_proxy_dedup_off.txt。
+            bool bodyChanged = false;
+            if (DedupEnabled() && root.Contains("prompt"))
+            {
+                string pr0 = root["prompt"] as string;
+                if (pr0 != null)
+                {
+                    string collapsed = CollapseRepeatedBlocks(pr0);
+                    if (collapsed.Length != pr0.Length)
+                    {
+                        root["prompt"] = collapsed;
+                        bodyChanged = true;
+                        Log("[DEDUP] " + reqLine + " | 重複ブロックを畳んだ " +
+                            pr0.Length + "→" + collapsed.Length + "文字");
+                    }
+                }
+            }
+
+            if (root.Contains("json_schema") || root.Contains("grammar"))
+                return bodyChanged ? Encoding.UTF8.GetBytes(JsonSerialize(root)) : body;
             string prompt = root.Contains("prompt") ? root["prompt"] as string : null;
-            if (prompt == null) return body;
+            if (prompt == null)
+                return bodyChanged ? Encoding.UTF8.GetBytes(JsonSerialize(root)) : body;
 
             int schemaStart = FindSchemaStart(prompt);
-            if (schemaStart < 0) return body; // JSON出力を要求しないリクエスト
+            if (schemaStart < 0) // JSON出力を要求しないリクエスト
+                return bodyChanged ? Encoding.UTF8.GetBytes(JsonSerialize(root)) : body;
 
             object schema = null;
             int schemaEnd = schemaStart;
