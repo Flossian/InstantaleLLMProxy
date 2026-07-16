@@ -9,7 +9,7 @@ rem ============================================================
 setlocal
 for %%I in ("%~dp0..") do set "MOD=%%~fI"
 set "CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-set "SRC=%~dp0llm_proxy_gui.cs"
+set "SRCDIR=%~dp0gui"
 set "OUT=%MOD%\InstantaleLlmProxy.exe"
 
 if not exist "%CSC%" (
@@ -18,7 +18,7 @@ if not exist "%CSC%" (
     exit /b 1
 )
 
-"%CSC%" /nologo /optimize /codepage:65001 /target:winexe /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:"%OUT%" "%SRC%"
+"%CSC%" /nologo /optimize /codepage:65001 /target:winexe /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:"%OUT%" "%SRCDIR%\*.cs"
 if errorlevel 1 (
     echo [ERROR] build failed
     pause

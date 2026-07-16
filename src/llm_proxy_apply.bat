@@ -10,7 +10,7 @@ setlocal
 for %%I in ("%~dp0..") do set "MOD=%%~fI"
 for %%I in ("%~dp0..\..") do set "ROOT=%%~fI"
 set "CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-set "SRC=%~dp0llm_proxy.cs"
+set "SRCDIR=%~dp0proxy"
 set "OUT=%~dp0llm_proxy_wrapper.exe"
 
 if not exist "%CSC%" (
@@ -25,17 +25,27 @@ if not exist "%ROOT%\bin" (
     exit /b 1
 )
 
-echo [BUILD] %SRC%
-"%CSC%" /nologo /optimize /codepage:65001 /out:"%OUT%" "%SRC%"
+echo [BUILD] %SRCDIR%\*.cs
+"%CSC%" /nologo /optimize /codepage:65001 /out:"%OUT%" "%SRCDIR%\*.cs"
 if errorlevel 1 (
     echo [ERROR] build failed
     pause
     exit /b 1
 )
 
-call :apply "%ROOT%\bin\llama-b7054-bin-win-cpu-x64"
-call :apply "%ROOT%\bin\llama-b7054-bin-win-cuda-12.4-x64"
-call :apply "%ROOT%\bin\llama-b7054-bin-win-vulkan-x64"
+rem The folder name carries the bundled llama.cpp build number (llama-b7054-...),
+rem which changes whenever the game updates, so match by pattern instead of
+rem hardcoding the names.
+set "FOUND=0"
+for /d %%D in ("%ROOT%\bin\llama-*-bin-win-*") do (
+    set "FOUND=1"
+    call :apply "%%~fD"
+)
+if "%FOUND%"=="0" (
+    echo [ERROR] no backend folder found: %ROOT%\bin\llama-*-bin-win-*
+    pause
+    exit /b 1
+)
 
 echo.
 echo [DONE] llm_proxy applied. Rules: %MOD%\llm_replacements.txt

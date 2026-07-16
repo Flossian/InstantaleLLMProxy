@@ -9,9 +9,14 @@ rem ============================================================
 setlocal
 for %%I in ("%~dp0..\..") do set "ROOT=%%~fI"
 
-call :revert "%ROOT%\bin\llama-b7054-bin-win-cpu-x64"
-call :revert "%ROOT%\bin\llama-b7054-bin-win-cuda-12.4-x64"
-call :revert "%ROOT%\bin\llama-b7054-bin-win-vulkan-x64"
+rem Match by pattern: the folder name carries the bundled llama.cpp build number
+rem (llama-b7054-...), which changes whenever the game updates.
+set "FOUND=0"
+for /d %%D in ("%ROOT%\bin\llama-*-bin-win-*") do (
+    set "FOUND=1"
+    call :revert "%%~fD"
+)
+if "%FOUND%"=="0" echo [ERROR] no backend folder found: %ROOT%\bin\llama-*-bin-win-*
 
 echo.
 echo [DONE] reverted.
