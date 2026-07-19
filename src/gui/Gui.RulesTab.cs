@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 partial class MainForm
@@ -28,7 +29,7 @@ partial class MainForm
         bar.Controls.Add(MakeButton("タブ名変更", 100, OnRenameTab));
         bar.Controls.Add(MakeButton("タブ削除", 90, OnDeleteTab));
         var hint = new Label();
-        hint.Text = "タブ単位のチェックで一括ON/OFF。タブ見出しはドラッグで並び替え。確率は同じ置換前の中から抽選。保存で即時反映。セル内改行は Shift+Enter。";
+        hint.Text = "タブ単位のチェックで一括ON/OFF。タブ見出しはドラッグで並び替え。確率は同じ置換前の中から抽選。保存で即時反映。セル内改行は Shift+Enter。「正規表現」ONの行はパターン一致 (置換後で $1 参照可)。";
         hint.AutoSize = true;
         hint.ForeColor = Color.Gray;
         hint.Margin = new Padding(10, 8, 3, 0);
@@ -157,7 +158,7 @@ partial class MainForm
         _allSearch.TextChanged += delegate { RefreshAllGrid(); };
         var clr = MakeButton("クリア", 60, delegate { _allSearch.Text = ""; });
         var hint = new Label();
-        hint.Text = "全タブのルールを横断表示 (タブ名・置換前・置換後で検索)。行をダブルクリックすると該当タブの該当行へ移動。ここでは編集できません。";
+        hint.Text = "全タブのルールを横断表示 (タブ名・置換前・置換後・メモで検索)。行をダブルクリックすると該当タブの該当行へ移動。ここでは編集できません。";
         hint.AutoSize = true;
         hint.ForeColor = Color.Gray;
         hint.Margin = new Padding(10, 8, 3, 0);
@@ -184,6 +185,10 @@ partial class MainForm
         cOn.HeaderText = "有効";
         cOn.Width = 40;
         cOn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+        var cRx = new DataGridViewTextBoxColumn();
+        cRx.HeaderText = "正規表現";
+        cRx.Width = 64;
+        cRx.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
         var cProb = new DataGridViewTextBoxColumn();
         cProb.HeaderText = "置換確率(%)";
         cProb.Width = 84;
@@ -196,11 +201,17 @@ partial class MainForm
         cTo.HeaderText = "置換後";
         cTo.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
         cTo.FillWeight = 50;
+        var cMemo = new DataGridViewTextBoxColumn();
+        cMemo.HeaderText = "メモ";
+        cMemo.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        cMemo.FillWeight = 25;
         _allGrid.Columns.Add(cTab);
         _allGrid.Columns.Add(cOn);
+        _allGrid.Columns.Add(cRx);
         _allGrid.Columns.Add(cProb);
         _allGrid.Columns.Add(cFrom);
         _allGrid.Columns.Add(cTo);
+        _allGrid.Columns.Add(cMemo);
         _allGrid.CellDoubleClick += OnAllGridDoubleClick;
 
         page.Controls.Add(_allGrid);
@@ -221,19 +232,26 @@ partial class MainForm
             foreach (DataGridViewRow row in t.Grid.Rows)
             {
                 if (row.IsNewRow) continue;
-                string from = Convert.ToString(row.Cells[2].Value) ?? "";
-                string to = Convert.ToString(row.Cells[3].Value) ?? "";
+                string from = Convert.ToString(row.Cells[3].Value) ?? "";
+                string to = Convert.ToString(row.Cells[4].Value) ?? "";
+                string memo = Convert.ToString(row.Cells[5].Value) ?? "";
                 if (from.Trim().Length == 0 && to.Trim().Length == 0) continue;
                 if (q.Length > 0
                     && from.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0
                     && to.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0
+                    && memo.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0
                     && t.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0) continue;
                 object on = row.Cells[0].Value;
                 bool ruleOn = !(on is bool) || (bool)on;
-                string prob = Convert.ToString(row.Cells[1].Value) ?? "";
-                int idx = _allGrid.Rows.Add(t.Name, ruleOn ? "✓" : "", prob, from, to);
+                object rxc = row.Cells[1].Value;
+                bool isRegex = (rxc is bool) && (bool)rxc;
+                string prob = Convert.ToString(row.Cells[2].Value) ?? "";
+                int idx = _allGrid.Rows.Add(t.Name, ruleOn ? "✓" : "", isRegex ? "✓" : "",
+                    prob, from, to, memo);
                 var ar = _allGrid.Rows[idx];
                 ar.Tag = new AllRowRef { Tab = t, Row = row };
+                // 編集グリッドと同じく、正規表現ルールの置換前セルは淡黄色で示す
+                if (isRegex) ar.Cells[4].Style.BackColor = Color.LemonChiffon;
                 // タブOFF もしくは ルールOFF は灰色で「効いていない」ことを示す
                 if (!t.Enabled || !ruleOn) ar.DefaultCellStyle.ForeColor = Color.Gray;
             }
@@ -252,7 +270,7 @@ partial class MainForm
             g.ClearSelection();
             if (!ar.Row.IsNewRow && ar.Row.Index >= 0)
             {
-                int col = Math.Min(2, g.ColumnCount - 1); // 置換前セルにフォーカス
+                int col = Math.Min(3, g.ColumnCount - 1); // 置換前セルにフォーカス
                 g.CurrentCell = ar.Row.Cells[col];
                 ar.Row.Selected = true;
                 g.FirstDisplayedScrollingRowIndex = ar.Row.Index;
@@ -263,7 +281,7 @@ partial class MainForm
     }
 
     // ルール編集グリッドを1枚作る。列の並びは
-    //   0=有効(チェック) / 1=置換確率(%) / 2=置換前 / 3=置換後
+    //   0=有効(チェック) / 1=正規表現(チェック) / 2=置換確率(%) / 3=置換前 / 4=置換後 / 5=メモ
     // で固定。CollectRules や RefreshAllGrid はこの添字を直接使うので、
     // 列を増減・入れ替えする場合はそちらも合わせて直すこと。
     DataGridView CreateRuleGrid()
@@ -280,6 +298,11 @@ partial class MainForm
         colOn.Width = 40;
         colOn.TrueValue = true;
         colOn.FalseValue = false;
+        var colRegex = new DataGridViewCheckBoxColumn();
+        colRegex.HeaderText = "正規表現";
+        colRegex.Width = 64;
+        colRegex.TrueValue = true;
+        colRegex.FalseValue = false;
         var colProb = new DataGridViewTextBoxColumn();
         colProb.HeaderText = "置換確率(%)";
         colProb.Width = 84;
@@ -292,17 +315,38 @@ partial class MainForm
         colTo.HeaderText = "置換後";
         colTo.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
         colTo.FillWeight = 50;
+        var colMemo = new DataGridViewTextBoxColumn();
+        colMemo.HeaderText = "メモ";
+        colMemo.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        colMemo.FillWeight = 25;
         grid.Columns.Add(colOn);
+        grid.Columns.Add(colRegex);
         grid.Columns.Add(colProb);
         grid.Columns.Add(colFrom);
         grid.Columns.Add(colTo);
-        grid.CellValueChanged += delegate { _dirty = true; };
+        grid.Columns.Add(colMemo);
+        grid.CellValueChanged += delegate(object s, DataGridViewCellEventArgs ev)
+        {
+            _dirty = true;
+            // 正規表現チェックの切替で置換前セルの背景色 (CellFormatting) を描き直す
+            if (ev.ColumnIndex == 1 && ev.RowIndex >= 0) grid.InvalidateRow(ev.RowIndex);
+        };
         grid.RowsRemoved += delegate { _dirty = true; };
-        // 新規行のチェックは既定でON、置換確率は100
+        // 正規表現ルールの置換前セルは淡黄色にして一目で分かるようにする
+        grid.CellFormatting += delegate(object s, DataGridViewCellFormattingEventArgs ev)
+        {
+            if (ev.ColumnIndex != 3 || ev.RowIndex < 0) return;
+            var row = grid.Rows[ev.RowIndex];
+            if (row.IsNewRow) return;
+            object v = row.Cells[1].Value;
+            if (v is bool && (bool)v) ev.CellStyle.BackColor = Color.LemonChiffon;
+        };
+        // 新規行のチェックは既定で有効ON・正規表現OFF、置換確率は100
         grid.DefaultValuesNeeded += delegate(object s, DataGridViewRowEventArgs ev)
         {
             ev.Row.Cells[0].Value = true;
-            ev.Row.Cells[1].Value = "100";
+            ev.Row.Cells[1].Value = false;
+            ev.Row.Cells[2].Value = "100";
         };
         // チェックボックスはクリック直後に確定させる (即_dirtyにするため)
         grid.CurrentCellDirtyStateChanged += delegate
@@ -510,11 +554,13 @@ partial class MainForm
         var index = new Dictionary<string, List<RuleEntry>>(StringComparer.Ordinal);
         foreach (var r in rules)
         {
+            // プロキシと同様、正規表現とリテラルは同じ置換前文字列でも別グループ
+            string key = (r.IsRegex ? "R\0" : "L\0") + r.From;
             List<RuleEntry> g;
-            if (!index.TryGetValue(r.From, out g))
+            if (!index.TryGetValue(key, out g))
             {
                 g = new List<RuleEntry>();
-                index.Add(r.From, g);
+                index.Add(key, g);
                 groups.Add(g);
             }
             g.Add(r);
@@ -522,7 +568,16 @@ partial class MainForm
 
         foreach (var g in groups)
         {
-            if (!text.Contains(g[0].From)) continue;
+            bool hit;
+            if (g[0].IsRegex)
+            {
+                // 未保存 (未検証) のパターンでも押せるので、不正・タイムアウトは黙ってスキップ
+                try { hit = Regex.IsMatch(text, g[0].From, RegexOptions.None, TimeSpan.FromSeconds(1)); }
+                catch { continue; }
+            }
+            else
+                hit = text.Contains(g[0].From);
+            if (!hit) continue;
             int total = 0;
             foreach (var r in g) total += r.Prob;
             if (total <= 0) continue;
@@ -535,7 +590,18 @@ partial class MainForm
                 acc += r.Prob;
                 if (roll < acc) { chosen = r; break; }
             }
-            if (chosen != null) text = text.Replace(chosen.From, chosen.To);
+            if (chosen == null) continue;
+            if (chosen.IsRegex)
+            {
+                try
+                {
+                    text = Regex.Replace(text, chosen.From, chosen.To,
+                        RegexOptions.None, TimeSpan.FromSeconds(1));
+                }
+                catch { }
+            }
+            else
+                text = text.Replace(chosen.From, chosen.To);
         }
         _prevOut.Text = text;
     }

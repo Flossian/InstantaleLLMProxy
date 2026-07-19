@@ -78,6 +78,7 @@ static partial class LlmProxy
     // 置換ルール。From/To は照合・置換に使う実体 (\uXXXX エスケープ版も別ルールとして登録)。
     // DispFrom/DispTo はログ表示用の読みやすい形 (常に元の日本語)。
     // Prob は置換確率 (0-100)。同一Fromのルールはグループ化され、確率でどれか1つ (または無置換) が選ばれる。
+    // IsRegex=true は From を .NET 正規表現として照合・置換する (Rx にコンパイル済みを保持)。
     class Rule
     {
         public string From;
@@ -85,6 +86,8 @@ static partial class LlmProxy
         public string DispFrom;
         public string DispTo;
         public int Prob;
+        public bool IsRegex;
+        public System.Text.RegularExpressions.Regex Rx;
     }
 
     // 現在有効なルール一覧。再読込時は新しいリストへ丸ごと差し替える (読む側はロック不要)

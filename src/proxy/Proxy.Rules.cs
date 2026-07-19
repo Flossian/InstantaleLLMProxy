@@ -13,10 +13,16 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 static partial class LlmProxy
 {
+    // 行頭「regex:」のルールは置換前を .NET 正規表現として解釈する (GUIの「正規表現」列と連動)
+    const string RegexPrefix = "regex:";
+    // 暴走パターン (破滅的バックトラック) で中継が止まらないようにするための上限
+    static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(1);
+
     static List<Rule> LoadRules(string path)
     {
         var rules = new List<Rule>();
@@ -31,6 +37,12 @@ static partial class LlmProxy
             if (line.StartsWith("#offtab:", StringComparison.Ordinal)) { tabEnabled = false; continue; }
             if (line.StartsWith("#", StringComparison.Ordinal)) continue;
             if (!tabEnabled) continue;
+            bool isRegex = false;
+            if (line.StartsWith(RegexPrefix, StringComparison.Ordinal))
+            {
+                isRegex = true;
+                line = line.Substring(RegexPrefix.Length);
+            }
             int idx = line.IndexOf("=>", StringComparison.Ordinal);
             if (idx <= 0)
             {
@@ -52,6 +64,29 @@ static partial class LlmProxy
                 }
             }
             string to = rest;
+            if (isRegex)
+            {
+                Regex rx;
+                try { rx = new Regex(from, RegexOptions.None, RegexTimeout); }
+                catch (ArgumentException ex)
+                {
+                    Log("[WARN] 不正な正規表現ルールを無視: " + from + " (" + ex.Message + ")");
+                    continue;
+                }
+                // \uXXXX エスケープ版は機械変換すると正規表現の意味が変わるため作らない。
+                // エスケープ形式のプロンプトに正規表現で当てたい場合はパターン側に \\uXXXX を書く
+                rules.Add(new Rule
+                {
+                    From = from,
+                    To = to,
+                    DispFrom = from + "〔正規表現〕",
+                    DispTo = to,
+                    Prob = prob,
+                    IsRegex = true,
+                    Rx = rx
+                });
+                continue;
+            }
             rules.Add(new Rule { From = from, To = to, DispFrom = from, DispTo = to, Prob = prob });
             // Pythonの json.dumps(ensure_ascii=True) は日本語を \uXXXX にするので、その形も登録
             string ef = EscapeNonAscii(from);
@@ -116,16 +151,18 @@ static partial class LlmProxy
         catch { return body; } // バイナリはそのまま
         bool changed = false;
 
-        // 同一「置換前」のルールをグループ化する (出現順を保持)
+        // 同一「置換前」のルールをグループ化する (出現順を保持)。
+        // 正規表現とリテラルは同じ文字列でも意味が違うので先頭タグで別グループに分ける
         var groups = new List<List<Rule>>();
         var index = new Dictionary<string, List<Rule>>(StringComparer.Ordinal);
         foreach (var rule in rules)
         {
+            string key = (rule.IsRegex ? "R\0" : "L\0") + rule.From;
             List<Rule> g;
-            if (!index.TryGetValue(rule.From, out g))
+            if (!index.TryGetValue(key, out g))
             {
                 g = new List<Rule>();
-                index.Add(rule.From, g);
+                index.Add(key, g);
                 groups.Add(g);
             }
             g.Add(rule);
@@ -136,7 +173,14 @@ static partial class LlmProxy
         // 合計が100超 : 各ルールは (確率/合計) で発動し、必ずどれかに置換される。
         foreach (var g in groups)
         {
-            if (!text.Contains(g[0].From)) continue;
+            bool hit;
+            try { hit = g[0].IsRegex ? g[0].Rx.IsMatch(text) : text.Contains(g[0].From); }
+            catch (RegexMatchTimeoutException)
+            {
+                Log("[WARN] 正規表現の照合がタイムアウトしたためスキップ: \"" + Snip(g[0].DispFrom) + "\"");
+                continue;
+            }
+            if (!hit) continue;
             int total = 0;
             foreach (var r in g) total += r.Prob;
             if (total <= 0)
@@ -160,7 +204,17 @@ static partial class LlmProxy
                     total + "/" + denom + ")");
                 continue;
             }
-            text = text.Replace(chosen.From, chosen.To);
+            if (chosen.IsRegex)
+            {
+                try { text = chosen.Rx.Replace(text, chosen.To); }
+                catch (RegexMatchTimeoutException)
+                {
+                    Log("[WARN] 正規表現の置換がタイムアウトしたためスキップ: \"" + Snip(chosen.DispFrom) + "\"");
+                    continue;
+                }
+            }
+            else
+                text = text.Replace(chosen.From, chosen.To);
             changed = true;
             LogIf(LogReplaceKey, "[REPLACE] " + reqLine + " | \"" + Snip(chosen.DispFrom) + "\" -> \"" + Snip(chosen.DispTo) +
                 "\" (確率" + chosen.Prob + "/" + denom + ")");

@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 partial class MainForm
@@ -19,9 +20,11 @@ partial class MainForm
     class RuleEntry
     {
         public bool Enabled;
+        public bool IsRegex; // 置換前を .NET 正規表現として解釈 (ファイル上は行頭「regex:」)
         public int Prob; // 置換確率 (0-100)
         public string From;
         public string To;
+        public string Memo; // 覚え書き。置換動作には影響しない
     }
 
     // タブ1枚分の保存用データ
@@ -33,8 +36,10 @@ partial class MainForm
     }
 
     const string DisabledPrefix = "#off:";
+    const string RegexPrefix = "regex:";    // 正規表現ルール (#off: の後ろに付く: #off:regex:...)
     const string TabPrefix = "#tab:";       // 有効なタブのセクション行
     const string OffTabPrefix = "#offtab:"; // 無効化されたタブのセクション行
+    const string MemoPrefix = "#memo:";     // 直後のルール行に対するメモ (プロキシはコメントとして無視)
     const string DefaultTabName = "標準";   // タブ行が無い旧形式ファイル用
 
     // ルールファイルを読んでタブとグリッドを作り直す。
@@ -44,6 +49,7 @@ partial class MainForm
         _ruleTabs.TabPages.Clear();
         _ruleTabs.TabPages.Add(_allPage); // 「すべて」タブは常に先頭に残す
         RuleTab cur = null;
+        string memo = null; // \u76F4\u524D\u306E #memo: \u884C\u306E\u5185\u5BB9\u3002\u6B21\u306E\u30EB\u30FC\u30EB\u884C\u306B\u53D6\u308A\u4ED8\u3051\u308B
         if (File.Exists(_rulesPath))
         {
             foreach (string raw in File.ReadAllLines(_rulesPath, Encoding.UTF8))
@@ -53,11 +59,18 @@ partial class MainForm
                 if (line.StartsWith(TabPrefix, StringComparison.Ordinal))
                 {
                     cur = AddRuleTab(line.Substring(TabPrefix.Length).Trim(), true);
+                    memo = null;
                     continue;
                 }
                 if (line.StartsWith(OffTabPrefix, StringComparison.Ordinal))
                 {
                     cur = AddRuleTab(line.Substring(OffTabPrefix.Length).Trim(), false);
+                    memo = null;
+                    continue;
+                }
+                if (line.StartsWith(MemoPrefix, StringComparison.Ordinal))
+                {
+                    memo = UnescapeNewlines(line.Substring(MemoPrefix.Length).Trim());
                     continue;
                 }
                 bool enabled = true;
@@ -67,6 +80,12 @@ partial class MainForm
                     line = line.Substring(DisabledPrefix.Length).Trim();
                 }
                 else if (line.StartsWith("#", StringComparison.Ordinal)) continue;
+                bool isRegex = false;
+                if (line.StartsWith(RegexPrefix, StringComparison.Ordinal))
+                {
+                    isRegex = true;
+                    line = line.Substring(RegexPrefix.Length);
+                }
                 int idx = line.IndexOf("=>", StringComparison.Ordinal);
                 if (idx <= 0) continue;
                 string from = line.Substring(0, idx);
@@ -84,8 +103,10 @@ partial class MainForm
                     }
                 }
                 if (cur == null) cur = AddRuleTab(DefaultTabName, true); // 旧形式 (タブ行なし)
-                cur.Grid.Rows.Add(enabled, prob.ToString(),
-                    UnescapeNewlines(from), UnescapeNewlines(rest));
+                // 正規表現の置換前は \n の2文字自体がパターンの一部なので改行に展開しない
+                cur.Grid.Rows.Add(enabled, isRegex, prob.ToString(),
+                    isRegex ? from : UnescapeNewlines(from), UnescapeNewlines(rest), memo ?? "");
+                memo = null;
             }
         }
         if (RealTabCount() == 0) AddRuleTab(DefaultTabName, true);
@@ -135,6 +156,11 @@ partial class MainForm
         sb.AppendLine("#   (GUIのグリッド上では実際の改行として表示・編集される)");
         sb.AppendLine("# ・行頭 # はコメント / UTF-8で保存");
         sb.AppendLine("# ・行頭 #off: は無効化されたルール (GUIの「有効」チェックで切替)");
+        sb.AppendLine("# ・行頭 regex: は正規表現ルール (GUIの「正規表現」チェックと連動)");
+        sb.AppendLine("#   .NET正規表現。置換後では $1 $2 でキャプチャを参照できる ($自体は $$)");
+        sb.AppendLine("#   プロンプト中の改行 (JSON内の \\n の2文字) に当てるにはパターンに \\\\n と書く");
+        sb.AppendLine("#   正規表現ルールには \\uXXXX エスケープ形式の自動対応が無い (必要なら自分で書く)");
+        sb.AppendLine("# ・#memo:メモ の行は直後のルールの覚え書き (GUIのメモ欄と連動、置換には影響しない)");
         sb.AppendLine("# ・変更を保存すると次のLLMリクエストから自動反映 (ゲーム再起動不要)");
         sb.AppendLine("# ・このファイルは管理GUIからも編集できます (InstantaleLlmProxy.exe)");
         sb.AppendLine("# ============================================================");
@@ -143,9 +169,12 @@ partial class MainForm
             sb.AppendLine();
             sb.AppendLine((t.Enabled ? TabPrefix : OffTabPrefix) + t.Name);
             foreach (var r in t.Rules)
-                sb.AppendLine((r.Enabled ? "" : DisabledPrefix) +
+            {
+                if (r.Memo.Length > 0) sb.AppendLine(MemoPrefix + EscapeNewlines(r.Memo));
+                sb.AppendLine((r.Enabled ? "" : DisabledPrefix) + (r.IsRegex ? RegexPrefix : "") +
                               EscapeNewlines(r.From) + "=>" + EscapeNewlines(r.To) +
                               (r.Prob == 100 ? "" : "=>" + r.Prob));
+            }
         }
         Directory.CreateDirectory(Path.GetDirectoryName(_rulesPath)); // 新配置のフォルダが無ければ作る
         File.WriteAllText(_rulesPath, sb.ToString(), new UTF8Encoding(true));
@@ -196,16 +225,21 @@ partial class MainForm
             if (row.IsNewRow) continue;
             object on = row.Cells[0].Value;
             bool enabled = !(on is bool) || (bool)on; // 未設定はONとみなす
-            string probText = Convert.ToString(row.Cells[1].Value);
-            string from = Convert.ToString(row.Cells[2].Value);
-            string to = Convert.ToString(row.Cells[3].Value);
+            object rxc = row.Cells[1].Value;
+            bool isRegex = (rxc is bool) && (bool)rxc; // 未設定はOFF (通常の文字一致)
+            string probText = Convert.ToString(row.Cells[2].Value);
+            string from = Convert.ToString(row.Cells[3].Value);
+            string to = Convert.ToString(row.Cells[4].Value);
+            string rowMemo = Convert.ToString(row.Cells[5].Value);
             if (probText == null) probText = "";
             if (from == null) from = "";
             if (to == null) to = "";
+            if (rowMemo == null) rowMemo = "";
             probText = probText.Trim();
             // 先頭/末尾の改行は意図的に入れている可能性があるので、空白とタブだけ落とす
             from = from.Trim(' ', '\t');
             to = to.Trim(' ', '\t');
+            rowMemo = rowMemo.Trim();
             if (from.Length == 0 && to.Length == 0) continue;
             int prob = 100; // 未入力は100 (常に置換)
             bool probOk = probText.Length == 0 ||
@@ -228,20 +262,53 @@ partial class MainForm
                     ShowRuleError(tab, row, "「=>」は使用できません。");
                     return null;
                 }
-                string jsonErr = CheckJsonStringSafe(from);
-                if (jsonErr != null)
+                if (isRegex)
                 {
-                    ShowRuleError(tab, row, "置換前: " + jsonErr);
-                    return null;
+                    // パターンはJSON文字列の中身検査 (CheckJsonStringSafe) の対象外。
+                    // \d などJSONでは不正なエスケープが正規表現では普通に使われるため、
+                    // 代わりにコンパイルできるかどうかで検証する
+                    if (from.IndexOf('\n') >= 0 || from.IndexOf('\r') >= 0)
+                    {
+                        ShowRuleError(tab, row,
+                            "正規表現の置換前にセル内改行は使えません。プロンプト中の改行に" +
+                            "マッチさせるにはパターンに「\\\\n」と書いてください。");
+                        return null;
+                    }
+                    try { new Regex(from, RegexOptions.None, TimeSpan.FromSeconds(1)); }
+                    catch (ArgumentException ex)
+                    {
+                        ShowRuleError(tab, row, "正規表現が不正です: " + ex.Message);
+                        return null;
+                    }
                 }
-                jsonErr = CheckJsonStringSafe(to);
-                if (jsonErr != null)
+                else
                 {
-                    ShowRuleError(tab, row, "置換後: " + jsonErr);
+                    if (from.StartsWith(RegexPrefix, StringComparison.Ordinal))
+                    {
+                        ShowRuleError(tab, row,
+                            "置換前を「regex:」で始めることはできません (ファイル上で正規表現" +
+                            "ルールと区別できなくなるため)。");
+                        return null;
+                    }
+                    string jsonErr = CheckJsonStringSafe(from);
+                    if (jsonErr != null)
+                    {
+                        ShowRuleError(tab, row, "置換前: " + jsonErr);
+                        return null;
+                    }
+                }
+                string jsonErrTo = CheckJsonStringSafe(to);
+                if (jsonErrTo != null)
+                {
+                    ShowRuleError(tab, row, "置換後: " + jsonErrTo);
                     return null;
                 }
             }
-            rules.Add(new RuleEntry { Enabled = enabled, Prob = prob, From = from, To = to });
+            rules.Add(new RuleEntry
+            {
+                Enabled = enabled, IsRegex = isRegex, Prob = prob,
+                From = from, To = to, Memo = rowMemo
+            });
         }
         return rules;
     }
