@@ -343,6 +343,7 @@ static partial class LlmProxy
         return sb.ToString();
     }
 
+    // 識別用キーで暗号強度は不要。起動引数パターンの種類は少なく、12桁で実用上衝突しない
     static string ShortHash(string s)
     {
         using (var md5 = MD5.Create())
@@ -518,7 +519,9 @@ static partial class LlmProxy
         catch { Environment.Exit(1); }
     }
 
-    // Windowsの引数クォート規約でエスケープする
+    // Windows (CommandLineToArgvW/MSVCRT) の引数クォート規約でエスケープする。
+    // 素朴に " を \" に置換するだけでは、直前に連続する \ の解釈がずれて壊れるため
+    // (\ の連なりは直後が " のときだけ倍加してエスケープする規約)、bs で保留中の連続 \ 数を数える
     static string QuoteArg(string a)
     {
         if (a.Length > 0 && a.IndexOfAny(new[] { ' ', '\t', '"' }) < 0) return a;

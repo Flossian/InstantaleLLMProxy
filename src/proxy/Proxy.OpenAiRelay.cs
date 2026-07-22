@@ -97,6 +97,10 @@ static partial class LlmProxy
         public string Auth;    // Authorization ヘッダの値 (ゲーム側APIキーの引き継ぎ用)
     }
 
+    // ネイティブ経路(HandleClient)と違い、こちらはリクエスト全体をメモリに読んでから
+    // 完全なHTTPレスポンス(ヘッダ+ボディ)を組み立てて返す方式。ゲーム→上流→ゲームの
+    // 中間で内容を作り替える(llama.cpp形式⇔OpenAI形式の翻訳)必要があるため、
+    // レスポンス方向を無加工で素通しする PipeRaw は使えない
     static void HandleClientOpenAi(TcpClient client)
     {
         try
@@ -118,6 +122,10 @@ static partial class LlmProxy
         finally { SafeClose(client); }
     }
 
+    // ネイティブ経路の ForwardOneRequest と役割は同じ(ヘッダ解析+ボディ読取)だが、
+    // こちらはボディをその場で上流へ転送せず HttpReq に保持して返す。
+    // OpenAI互換モードは経路によって行き先(/apply-templateの自前処理、上流サーバへの
+    // 翻訳・素通し等)がまちまちで、ヘッダ解析の直後に転送先を決め打てないため
     static HttpReq ReadHttpRequest(BufferedStream reader)
     {
         byte[] header = ReadHeaderBlock(reader);
@@ -388,6 +396,15 @@ static partial class LlmProxy
                     changed = true;
                 }
             }
+            if (EventLogTrimEnabled())
+            {
+                string trimmed = TrimEventLog(content, reqLine);
+                if (trimmed.Length != content.Length)
+                {
+                    content = trimmed;
+                    changed = true;
+                }
+            }
             if (SchemaCompactEnabled())
             {
                 string compacted = CompactEmbeddedSchema(content, reqLine);
@@ -547,6 +564,11 @@ static partial class LlmProxy
                         prompt.Length + "→" + collapsed.Length + "文字");
                     prompt = collapsed;
                 }
+            }
+            if (EventLogTrimEnabled())
+            {
+                string trimmed = TrimEventLog(prompt, req.RawReqLine);
+                if (trimmed.Length != prompt.Length) prompt = trimmed;
             }
             int ss = FindSchemaStart(prompt);
             if (ss >= 0)

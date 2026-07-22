@@ -20,32 +20,41 @@ static partial class LlmProxy
     const string JsonFixOffFileName = "llm_proxy_jsonfix_off.txt";
     const string DedupOffFileName = "llm_proxy_dedup_off.txt";
     const string SingletonOffFileName = "llm_proxy_singleton_off.txt";
+    const string EventLogTrimOffFileName = "llm_proxy_eventlog_off.txt";
     const string DiagOnFileName = "llm_proxy_diag_on.txt";
     const string SettingsFileName = "llm_proxy_settings.ini";
 
-    static bool JsonFixEnabled()
+    // MODフォルダ直下に決め打ちの名前の空ファイルを置くだけで判定できる「フラグファイル」の共通実装。
+    // JsonFixEnabled/DedupEnabled/SingletonEnabled が使う。この3つは ini設定やGUIのチェックボックスを
+    // 持たない切り分け専用スイッチで、ファイルを置く/消すだけで確実に切り替えられることを優先している
+    static bool FlagFileExists(string fileName)
     {
         try
         {
             string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
                                                 : Path.GetDirectoryName(_logPath);
-            if (baseDir == null) return true;
-            return !File.Exists(Path.Combine(baseDir, JsonFixOffFileName));
+            return baseDir != null && File.Exists(Path.Combine(baseDir, fileName));
         }
-        catch { return true; }
+        catch { return false; }
+    }
+
+    // JSON安定化(JSONFIX)はデフォルトON。無効化はMODフォルダに llm_proxy_jsonfix_off.txt を置く
+    static bool JsonFixEnabled()
+    {
+        return !FlagFileExists(JsonFixOffFileName);
     }
 
     // プロンプト重複ブロックの畳み込みはデフォルトON。無効化はMODフォルダに llm_proxy_dedup_off.txt。
     static bool DedupEnabled()
     {
-        try
-        {
-            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
-                                                : Path.GetDirectoryName(_logPath);
-            if (baseDir == null) return true;
-            return !File.Exists(Path.Combine(baseDir, DedupOffFileName));
-        }
-        catch { return true; }
+        return !FlagFileExists(DedupOffFileName);
+    }
+
+    // 「今回のイベント内ログ」(field_event_evaluator/quest_referee_event_resolve)の
+    // 直近ターンのみ保持はデフォルトON。無効化はMODフォルダに llm_proxy_eventlog_off.txt。
+    static bool EventLogTrimEnabled()
+    {
+        return !FlagFileExists(EventLogTrimOffFileName);
     }
 
     // プロンプト内スキーマ説明のコンパクト化はデフォルトON。GUIの「プロンプト圧縮」チェックボックスで
@@ -167,6 +176,7 @@ static partial class LlmProxy
     const string LogReplaceKey = "log_replace"; // [REPLACE]/[SKIP]
     const string LogCompactKey = "log_compact"; // [COMPACT]
     const string LogDedupKey = "log_dedup";     // [DEDUP]
+    const string LogEventLogKey = "log_eventlog"; // [EVENTLOG]
     const string LogJsonFixKey = "log_jsonfix"; // [JSONFIX]
     const string LogRulesKey = "log_rules";     // [RULES]
     const string LogOpenAiKey = "log_openai";   // [OPENAI] (任意OpenAI互換サーバへの中継時のみ)
@@ -184,35 +194,18 @@ static partial class LlmProxy
 
     static bool DiagEnabled(string key)
     {
-        // 旧方式のフラグファイルが置かれていれば全項目ON (READMEに載っている切り分け手段を残す)。
-        // 項目別の設定より優先する = ファイルを置くだけで確実に全部出る、と説明できる形にする
-        if (LegacyDiagFileOn()) return true;
+        // 旧方式のフラグファイル(llm_proxy_diag_on.txt)が置かれていれば全項目ON (READMEに載っている
+        // 切り分け手段を残す)。項目別の設定より優先する = ファイルを置くだけで確実に全部出る、と
+        // 説明できる形にする
+        if (FlagFileExists(DiagOnFileName)) return true;
         return CachedSettingBool(key, CachedSettingBool("diag_log", false));
-    }
-
-    static bool LegacyDiagFileOn()
-    {
-        try
-        {
-            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
-                                                : Path.GetDirectoryName(_logPath);
-            return baseDir != null && File.Exists(Path.Combine(baseDir, DiagOnFileName));
-        }
-        catch { return false; }
     }
 
     // 本物のシングルトン化(集約)はデフォルトON。無効化はMODフォルダに llm_proxy_singleton_off.txt。
     // 無効時は各ラッパーが専用の本物を起動する(コンテキスト分割による context-exceeded の切り分け用)。
     static bool SingletonEnabled()
     {
-        try
-        {
-            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
-                                                : Path.GetDirectoryName(_logPath);
-            if (baseDir == null) return true;
-            return !File.Exists(Path.Combine(baseDir, SingletonOffFileName));
-        }
-        catch { return true; }
+        return !FlagFileExists(SingletonOffFileName);
     }
 
     // 診断ログ用に数値を取り出す。キーが無い/数値でない場合は -1 (「不明」の意味)

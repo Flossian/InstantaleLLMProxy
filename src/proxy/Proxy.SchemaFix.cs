@@ -98,6 +98,23 @@ static partial class LlmProxy
                 }
             }
 
+            // 「今回のイベント内ログ」の蓄積を直近3ターンだけに削る(field_event_evaluator/
+            // quest_referee_event_resolveのみ対象。マーカーの無いプロンプトには作用しない)。
+            // json_schemaの有無に関わらず適用する(DEDUPと同じ位置づけ)
+            if (EventLogTrimEnabled() && root.Contains("prompt"))
+            {
+                string pr2 = root["prompt"] as string;
+                if (pr2 != null)
+                {
+                    string trimmed = TrimEventLog(pr2, reqLine);
+                    if (trimmed.Length != pr2.Length)
+                    {
+                        root["prompt"] = trimmed;
+                        bodyChanged = true;
+                    }
+                }
+            }
+
             if (root.Contains("json_schema") || root.Contains("grammar"))
             {
                 // ゲーム自身が既に json_schema (grammar制約) を送っているのが実運用のほぼ全件。

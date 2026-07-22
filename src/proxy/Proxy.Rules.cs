@@ -356,6 +356,41 @@ static partial class LlmProxy
         return p;
     }
 
+    // field_event_evaluator / quest_referee_event_resolve の2種のプロンプトに現れる
+    // 「【今回のイベント内ログ】」ブロックは、名前に反して「今回のイベント」の過去ターンだけでなく
+    // クエスト全体で発生した全フィールドイベントの履歴を延々と蓄積する(新クエスト開始でのみ
+    // リセットされる)。フィールドイベント自体は必ず3ターン以内に終わる設計のため、判定に古い
+    // ターンの詳細は不要。実データでは終盤に29ターン・8,300文字超(プロンプト全体の6割超)に
+    // 達することを確認したため、直近3ターンだけ残し、それより前は無言で削る。
+    const string EventLogMarker = "【今回のイベント内ログ】";
+    const string EventLogTurnMarker = "〈プレイヤーの入力〉";
+    const int EventLogKeepTurns = 3;
+
+    internal static string TrimEventLog(string text, string reqLine)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        int markerIdx = text.IndexOf(EventLogMarker, StringComparison.Ordinal);
+        if (markerIdx < 0) return text; // このブロックを持たないプロンプトには作用しない
+        int bodyStart = markerIdx + EventLogMarker.Length;
+
+        var turnStarts = new List<int>();
+        int p = bodyStart;
+        while (true)
+        {
+            int f = text.IndexOf(EventLogTurnMarker, p, StringComparison.Ordinal);
+            if (f < 0) break;
+            turnStarts.Add(f);
+            p = f + EventLogTurnMarker.Length;
+        }
+        if (turnStarts.Count <= EventLogKeepTurns) return text; // 直近件数以内なら削る必要なし
+
+        int cutFrom = turnStarts[turnStarts.Count - EventLogKeepTurns];
+        string trimmed = text.Substring(0, bodyStart) + text.Substring(cutFrom);
+        LogIf(LogEventLogKey, "[EVENTLOG] " + reqLine + " | 過去ターンを削減 " +
+            turnStarts.Count + "→" + EventLogKeepTurns + "件 (" + text.Length + "→" + trimmed.Length + "文字)");
+        return trimmed;
+    }
+
     // JSONFIXの対象は生成リクエストだけ。/apply-template などの前処理には触らない。
     // リクエスト行「POST /completion HTTP/1.1」からパス部分だけを取り出して判定する
     static bool IsCompletionRequest(string reqLine)

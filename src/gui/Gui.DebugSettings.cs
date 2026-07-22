@@ -30,6 +30,7 @@ partial class MainForm
             new LogOpt("log_replace", "置換 ([REPLACE] / [SKIP])"),
             new LogOpt("log_compact", "プロンプト圧縮 ([COMPACT])"),
             new LogOpt("log_dedup",   "重複ブロックの畳み込み ([DEDUP])"),
+            new LogOpt("log_eventlog", "イベント履歴ログの圧縮 ([EVENTLOG])"),
             new LogOpt("log_jsonfix", "JSON安定化 ([JSONFIX])"),
             new LogOpt("log_rules",   "ルールファイルの読込 ([RULES])"),
             new LogOpt("log_openai",  "OpenAI互換サーバへの中継 ([OPENAI])")
