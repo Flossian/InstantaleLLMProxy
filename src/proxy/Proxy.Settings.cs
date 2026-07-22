@@ -17,16 +17,21 @@ using System.Threading;
 
 static partial class LlmProxy
 {
-    const string JsonFixOffFileName = "llm_proxy_jsonfix_off.txt";
-    const string DedupOffFileName = "llm_proxy_dedup_off.txt";
-    const string SingletonOffFileName = "llm_proxy_singleton_off.txt";
-    const string EventLogTrimOffFileName = "llm_proxy_eventlog_off.txt";
     const string DiagOnFileName = "llm_proxy_diag_on.txt";
     const string SettingsFileName = "llm_proxy_settings.ini";
 
+    // GUIの「設定」→「機能設定...」で切り替えるキー。JsonFixEnabled/DedupEnabled/
+    // EventLogTrimEnabled/SingletonEnabled が使う。いずれもデフォルトON (ini/フラグファイル
+    // 無しなら有効)。旧版はMODフォルダに置く空ファイル(llm_proxy_*_off.txt)で無効化する
+    // 方式だったが、GUIから切り替えられるようini設定へ統一した
+    const string JsonFixKey = "jsonfix_enabled";
+    const string DedupKey = "dedup_enabled";
+    const string EventLogTrimKey = "eventlog_trim_enabled";
+    const string SingletonKey = "singleton_enabled";
+
     // MODフォルダ直下に決め打ちの名前の空ファイルを置くだけで判定できる「フラグファイル」の共通実装。
-    // JsonFixEnabled/DedupEnabled/SingletonEnabled が使う。この3つは ini設定やGUIのチェックボックスを
-    // 持たない切り分け専用スイッチで、ファイルを置く/消すだけで確実に切り替えられることを優先している
+    // 旧方式のDiagOnFileName (診断ログの一括上書きスイッチ) が使う。項目別の設定より優先される
+    // 上書きスイッチとして残しているため、こちらはini化していない
     static bool FlagFileExists(string fileName)
     {
         try
@@ -38,23 +43,24 @@ static partial class LlmProxy
         catch { return false; }
     }
 
-    // JSON安定化(JSONFIX)はデフォルトON。無効化はMODフォルダに llm_proxy_jsonfix_off.txt を置く
+    // JSON安定化(JSONFIX)はデフォルトON。GUIの「設定」→「機能設定...」で切り替えると
+    // llm_proxy_settings.ini の jsonfix_enabled キーに書かれ、ここで読む。
     static bool JsonFixEnabled()
     {
-        return !FlagFileExists(JsonFixOffFileName);
+        return CachedSettingBool(JsonFixKey, true);
     }
 
-    // プロンプト重複ブロックの畳み込みはデフォルトON。無効化はMODフォルダに llm_proxy_dedup_off.txt。
+    // プロンプト重複ブロックの畳み込みはデフォルトON。GUIの「設定」→「機能設定...」で切り替える。
     static bool DedupEnabled()
     {
-        return !FlagFileExists(DedupOffFileName);
+        return CachedSettingBool(DedupKey, true);
     }
 
     // 「今回のイベント内ログ」(field_event_evaluator/quest_referee_event_resolve)の
-    // 直近ターンのみ保持はデフォルトON。無効化はMODフォルダに llm_proxy_eventlog_off.txt。
+    // 直近ターンのみ保持はデフォルトON。GUIの「設定」→「機能設定...」で切り替える。
     static bool EventLogTrimEnabled()
     {
-        return !FlagFileExists(EventLogTrimOffFileName);
+        return CachedSettingBool(EventLogTrimKey, true);
     }
 
     // プロンプト内スキーマ説明のコンパクト化はデフォルトON。GUIの「プロンプト圧縮」チェックボックスで
@@ -201,11 +207,11 @@ static partial class LlmProxy
         return CachedSettingBool(key, CachedSettingBool("diag_log", false));
     }
 
-    // 本物のシングルトン化(集約)はデフォルトON。無効化はMODフォルダに llm_proxy_singleton_off.txt。
+    // 本物のシングルトン化(集約)はデフォルトON。GUIの「設定」→「機能設定...」で切り替える。
     // 無効時は各ラッパーが専用の本物を起動する(コンテキスト分割による context-exceeded の切り分け用)。
     static bool SingletonEnabled()
     {
-        return !FlagFileExists(SingletonOffFileName);
+        return CachedSettingBool(SingletonKey, true);
     }
 
     // 診断ログ用に数値を取り出す。キーが無い/数値でない場合は -1 (「不明」の意味)

@@ -239,6 +239,7 @@ partial class MainForm : Form
         menu.ShowItemToolTips = true; // 既定falseのままだと各項目の ToolTipText が表示されない
 
         var settings = new ToolStripMenuItem("設定(&S)");
+        settings.DropDownItems.Add(new ToolStripMenuItem("機能設定...", null, OnOpenFeatureSettings));
         settings.DropDownItems.Add(new ToolStripMenuItem("デバッグ設定...", null, OnOpenDebugSettings));
 
         // 任意OpenAI互換サーバへの中継 (接続設定と、ゲーム側OpenAI設定用の中継サーバの起動/停止)
@@ -515,6 +516,9 @@ partial class MainForm : Form
         sb.AppendLine("; InstantaleLlmProxy 設定ファイル (GUIの操作で自動生成・更新)");
         sb.AppendLine("; key=value 形式。手動編集も可。保存すると次のLLMリクエストから反映(一部は要ゲーム再起動)");
         sb.AppendLine("; ・schema_compact: プロンプトに埋め込まれたJSONスキーマ説明を圧縮するか (1/0)");
+        sb.AppendLine("; ・jsonfix_enabled / dedup_enabled / eventlog_trim_enabled / singleton_enabled:");
+        sb.AppendLine(";   自動的な安定化・軽量化機能(JSONFIX/DEDUP/EVENTLOG/シングルトン化)のON/OFF");
+        sb.AppendLine(";   (1/0・既定1。GUIの「設定」→「機能設定...」で切替)");
         sb.AppendLine("; ・log_replace / log_compact / log_dedup / log_jsonfix / log_rules / log_openai:");
         sb.AppendLine(";   llm_proxy.log に出す動作ログの項目別ON/OFF (1/0・既定1)");
         sb.AppendLine("; ・log_diag: [DIAG]診断行を出すか (1/0・調査用・既定0)");

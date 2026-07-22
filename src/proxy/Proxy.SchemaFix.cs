@@ -27,7 +27,7 @@ static partial class LlmProxy
     // ・スキーマの解析に失敗した場合は汎用JSON文法(GBNF)で最低限の構文を保証
     // ・ゲーム側が既に json_schema / grammar を指定している場合は何もしない
     // ・スキーマ指示の無いリクエスト (自由文ナレーション等) には作用しない
-    // ・無効化したい場合はMODフォルダに llm_proxy_jsonfix_off.txt を置く
+    // ・無効化したい場合はGUIの「設定」→「機能設定...」で切り替える
     internal static byte[] ApplyJsonSchemaFix(byte[] body, string reqLine)
     {
         try
@@ -80,7 +80,7 @@ static partial class LlmProxy
 
             // プロンプト内で大きなブロックが直後に完全一致で繰り返される(tandem repeat)場合、1個に畳む。
             // ゲームがスキーマ系システムメッセージを再生成のたびに重複追加し、コンテキスト枯渇→500エラーを
-            // 起こす不具合の対策。json_schemaの有無に関わらず適用する。無効化は MODフォルダに llm_proxy_dedup_off.txt。
+            // 起こす不具合の対策。json_schemaの有無に関わらず適用する。無効化はGUIの「設定」→「機能設定...」。
             bool bodyChanged = false;
             if (DedupEnabled() && root.Contains("prompt"))
             {

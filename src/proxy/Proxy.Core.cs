@@ -15,7 +15,7 @@
 //   本物のJSON Schemaへ変換して llama-server の json_schema パラメータに注入する。
 //   これによりサーバ側の文法制約付き生成が働き、構文的に壊れたJSONが
 //   出力されなくなる。詳細は「JSON安定化」セクションを参照。
-//   無効化するにはMODフォルダに llm_proxy_jsonfix_off.txt を置く。
+//   無効化するにはGUIの「設定」→「機能設定...」で切り替える。
 //
 // ルールファイル: <MODフォルダ>\llm_replacements.txt (UTF-8)
 //   MODフォルダの場所は、適用時に exe と同じ場所に書かれる llm_proxy_dir.txt で
@@ -419,7 +419,7 @@ static partial class LlmProxy
 
             // シングルトン無効時は集約せず、各ラッパーが自分専用の本物を起動する(従来動作)。
             // ゲームが並行生成する場合、共有だと1本の16384コンテキストを分割してしまい
-            // context-exceeded になるため、切り分け用のスイッチ (llm_proxy_singleton_off.txt)。
+            // context-exceeded になるため、切り分け用のスイッチ (GUIの「設定」→「機能設定...」)。
             if (!SingletonEnabled())
             {
                 BecomeOwner(Process.GetCurrentProcess().Id);
