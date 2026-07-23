@@ -35,6 +35,27 @@ partial class MainForm
         public List<RuleEntry> Rules;
     }
 
+    // llm_replacements.txt が置かれているフォルダをエクスプローラーで開く
+    void OpenRulesFolder()
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(_rulesPath);
+            if (dir == null || !Directory.Exists(dir))
+            {
+                MessageBox.Show(this, "フォルダが見つかりません:\n" + dir, "エラー",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            Process.Start(new ProcessStartInfo("explorer.exe", "\"" + dir + "\"") { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "フォルダを開けませんでした:\n" + ex.Message, "エラー",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     const string DisabledPrefix = "#off:";
     const string RegexPrefix = "regex:";    // 正規表現ルール (#off: の後ろに付く: #off:regex:...)
     const string TabPrefix = "#tab:";       // 有効なタブのセクション行

@@ -110,6 +110,7 @@ static partial class LlmProxy
     static volatile bool _isOwner;
     static volatile int _ownerPid;          // 共有している本物を所有するラッパーのpid
     static volatile bool _watchStarted;     // WatchChildスレッドを二重起動しないためのフラグ
+    static volatile bool _registryCleaned;  // 起動時のレジストリ掃除(CleanupStaleRegistries)を1回だけ行うためのフラグ
     static readonly object AcquireLock = new object();
     static readonly string SelfProcName = Process.GetCurrentProcess().ProcessName;
 
@@ -368,6 +369,32 @@ static partial class LlmProxy
         catch { return null; }
     }
 
+    // 起動引数(モデル・設定)が変わるたびに集約キーが変わり、llm_proxy_upstream_<hash>.txt が
+    // 増え続ける。所有者が既に居ない(=誰も参照しない)ファイルは無害だが放置され続けるため、
+    // 起動のたびに全ハッシュ分を見て、所有者不在のものを削除する。自分のハッシュ分も対象に
+    // 含めてよい: 所有者不在なら削除後にこの後の AcquireUpstream がどのみち自分を所有者にする
+    static void CleanupStaleRegistries()
+    {
+        try
+        {
+            string baseDir = _rulesPath != null ? Path.GetDirectoryName(_rulesPath)
+                                                : Path.GetDirectoryName(_logPath);
+            if (baseDir == null) return;
+            foreach (string f in Directory.GetFiles(baseDir, "llm_proxy_upstream_*.txt"))
+            {
+                try
+                {
+                    string[] parts = File.ReadAllText(f).Trim().Split(',');
+                    int pid;
+                    if (parts.Length < 2 || !int.TryParse(parts[0].Trim(), out pid) || !IsWrapperAlive(pid))
+                        File.Delete(f);
+                }
+                catch { try { File.Delete(f); } catch { } } // 壊れたファイルも同様に片付ける
+            }
+        }
+        catch { }
+    }
+
     static bool ReadRegistry(out int pid, out int port)
     {
         pid = 0; port = 0;
@@ -416,6 +443,8 @@ static partial class LlmProxy
         lock (AcquireLock)
         {
             if (_isOwner) return; // 既に自分が所有しているなら何もしない
+
+            if (!_registryCleaned) { _registryCleaned = true; CleanupStaleRegistries(); }
 
             // シングルトン無効時は集約せず、各ラッパーが自分専用の本物を起動する(従来動作)。
             // ゲームが並行生成する場合、共有だと1本の16384コンテキストを分割してしまい

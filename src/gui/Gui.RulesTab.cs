@@ -25,6 +25,7 @@ partial class MainForm
         {
             if (ConfirmDiscardIfDirty()) LoadRules();
         }));
+        bar.Controls.Add(MakeButton("フォルダを開く", 110, delegate { OpenRulesFolder(); }));
         bar.Controls.Add(MakeButton("タブ追加", 90, OnAddTab));
         bar.Controls.Add(MakeButton("タブ名変更", 100, OnRenameTab));
         bar.Controls.Add(MakeButton("タブ削除", 90, OnDeleteTab));

@@ -52,6 +52,9 @@ static partial class LlmProxy
         Log("[BOOT] OpenAI互換中継: listen 127.0.0.1:" + listenPort + " -> " + _openai.Endpoint +
             (string.IsNullOrEmpty(_openai.Model) ? "" : " (model既定 " + _openai.Model + ")"));
 
+        var gameWatch = new Thread(WatchGameProcess) { IsBackground = true };
+        gameWatch.Start();
+
         while (true)
         {
             TcpClient client = listener.AcceptTcpClient();
@@ -73,6 +76,35 @@ static partial class LlmProxy
                 Process.GetCurrentProcess().Id + "," + port);
         }
         catch { }
+    }
+
+    // ゲーム本体(instantale.exe)のプロセス名。中継サーバはGUIの子プロセスにしない
+    // (GUIを閉じても動き続ける)ため、代わりにゲーム本体の生死を監視して自動終了する。
+    const string GameProcessName = "instantale";
+
+    // ゲームがまだ起動していない間(中継サーバを先に起動した直後など)に誤って
+    // 即終了しないよう、一度でもゲームの起動を確認してから「いなくなったら終了」に切り替える。
+    static void WatchGameProcess()
+    {
+        bool everSeen = false;
+        while (true)
+        {
+            Thread.Sleep(10000);
+            bool running = IsGameRunning();
+            if (running) everSeen = true;
+            else if (everSeen)
+            {
+                Log("[OPENAI] ゲーム(" + GameProcessName + ".exe)の終了を検知、中継サーバーを終了します");
+                Environment.Exit(0);
+            }
+        }
+    }
+
+    static bool IsGameRunning()
+    {
+        Process[] procs = Process.GetProcessesByName(GameProcessName);
+        try { return procs.Length > 0; }
+        finally { foreach (Process p in procs) p.Dispose(); }
     }
 
     // .NET Framework 4 の既定は TLS1.2 が無効なことがあるので明示的に有効化する。
@@ -478,12 +510,18 @@ static partial class LlmProxy
         catch (WebException wex)
         {
             // 上流がHTTPエラーを返した場合は、そのステータスとボディをそのまま
-            // ゲームへ返す(ゲームはOpenAI形式のエラーを解釈できる前提のため)
+            // ゲームへ返す(ゲームはOpenAI形式のエラーを解釈できる前提のため)。
+            // ボディは一度だけ読み、ログには先頭500文字、ゲームへは全文を転送する。
             var er = wex.Response as HttpWebResponse;
             if (er != null)
             {
-                Log("[OPENAI] passthrough 上流エラー HTTP " + (int)er.StatusCode);
-                RelayHttpResponse(cs, er, req.KeepAlive);
+                byte[] body;
+                using (var rs = er.GetResponseStream()) body = ReadAllBytes(rs);
+                string bodyText = body.Length > 0
+                    ? Encoding.UTF8.GetString(body, 0, Math.Min(body.Length, 500))
+                    : "";
+                Log("[OPENAI] passthrough 上流エラー HTTP " + (int)er.StatusCode + " " + bodyText);
+                RelayHttpResponseBytes(cs, er, body, req.KeepAlive);
                 return req.KeepAlive;
             }
             Log("[OPENAI] passthrough 接続失敗: " + wex.Message);
@@ -522,6 +560,38 @@ static partial class LlmProxy
             WriteChunkEnd(cs);
         }
         finally { try { resp.Close(); } catch { } }
+    }
+
+    // 既にバイト列として読み込んだ上流レスポンス(エラーログ用に先読みした場合)を、
+    // ステータス・Content-Typeを保ってそのままゲームへ流す
+    static void RelayHttpResponseBytes(NetworkStream cs, HttpWebResponse resp, byte[] body, bool keepAlive)
+    {
+        try
+        {
+            string ct = resp.ContentType;
+            if (string.IsNullOrEmpty(ct)) ct = "application/json";
+            WriteResponseHead(cs, (int)resp.StatusCode + " " + resp.StatusDescription, new[]
+            {
+                "Content-Type: " + ct,
+                "Cache-Control: no-cache",
+                "Connection: " + (keepAlive ? "keep-alive" : "close"),
+                "Transfer-Encoding: chunked"
+            });
+            if (body.Length > 0) WriteChunk(cs, body, body.Length);
+            WriteChunkEnd(cs);
+        }
+        finally { try { resp.Close(); } catch { } }
+    }
+
+    static byte[] ReadAllBytes(Stream s)
+    {
+        using (var ms = new MemoryStream())
+        {
+            var buf = new byte[65536];
+            int n;
+            while ((n = s.Read(buf, 0, buf.Length)) > 0) ms.Write(buf, 0, n);
+            return ms.ToArray();
+        }
     }
 
     // 上流に到達できなかったときのOpenAI形式エラー(502)

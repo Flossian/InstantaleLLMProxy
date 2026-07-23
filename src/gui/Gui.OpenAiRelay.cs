@@ -277,7 +277,9 @@ partial class MainForm
 
     // ---- スタンドアロン中継サーバ (llm_proxy_wrapper.exe --openai-relay) の起動/停止 ----
     // 状態はプロキシが起動時に書く llm_proxy_relay.txt (pid,port) で判定する。
-    // GUIの子プロセスにはしないので、GUIを閉じても中継サーバは動き続ける (停止はメニューから)。
+    // GUIの子プロセスにはしないので、GUIを閉じても中継サーバは動き続ける (手動停止はメニューから)。
+    // ただし中継サーバ自身がゲーム本体(instantale.exe)の生死を監視しており、ゲームが
+    // 終了すると自動的に道連れで終了する (WatchGameProcess, Proxy.OpenAiRelay.cs)。
 
     string RelayPidPath()
     {
@@ -386,7 +388,8 @@ partial class MainForm
                 "中継サーバを起動しました (port " + listenPort + ")。\n\n" +
                 "ゲーム内のOpenAI互換設定のエンドポイントに\n" +
                 "  http://127.0.0.1:" + listenPort + "/v1\n" +
-                "を指定してください。GUIを閉じても中継サーバは動き続けます (停止はこのメニューから)。",
+                "を指定してください。GUIを閉じても中継サーバは動き続けます。\n" +
+                "ゲームを終了すると中継サーバも自動的に終了します (手動停止はこのメニューから)。",
                 "起動", MessageBoxButtons.OK, MessageBoxIcon.Information);
         else
             MessageBox.Show(this,
